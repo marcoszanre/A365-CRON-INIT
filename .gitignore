@@ -1,0 +1,81 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+.env/
+
+# Environment files (contain secrets)
+.env
+.env.local
+.env_local
+.env.production
+.env.development
+
+# Agent 365 CLI generated files (contain secrets and tenant-specific config)
+a365.config.json
+a365.generated.config.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+devTools/*.log
+
+# Dev tools folder (contains test scripts with tokens)
+devTools/
+
+# Test artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Package lock (optional - uncomment if you want to track)
+# uv.lock
+
+# Build artifacts
+manifest/manifest.zip
+
+# Token cache
+token_cache.bin
