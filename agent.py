@@ -250,7 +250,12 @@ class AgentFrameworkAgent(AgentInterface):
         # Initialize MCP services
         self._initialize_services()
 
-        # Track if MCP servers have been set up
+        # MCP initialization state - now done at startup, not first request
+        self.mcp_servers_initialized = False
+        self._mcp_init_error: Optional[str] = None
+        self._mcp_init_error: Optional[str] = None
+        
+        # Track if MCP servers have been set up (legacy flag for compatibility)
         self.mcp_servers_initialized = False
 
     # </Initialization>
@@ -348,46 +353,120 @@ class AgentFrameworkAgent(AgentInterface):
             logger.warning(f"⚠️ MCP tool service failed: {e}")
             self.tool_service = None
 
-    async def setup_mcp_servers(self, auth: Authorization, auth_handler_name: Optional[str], context: TurnContext):
-        """Set up MCP server connections"""
+    async def startup_initialize_mcp(
+        self, 
+        auth: Authorization, 
+        auth_handler_name: Optional[str], 
+        context: TurnContext,
+        auth_token: Optional[str] = None,
+    ):
+        """
+        Initialize MCP servers at startup.
+        
+        Called once during server startup to ensure all MCP servers are connected
+        and ready BEFORE any user requests arrive. This eliminates the 15-20+ second
+        delay on first request.
+        
+        Args:
+            auth: Authorization handler
+            auth_handler_name: Name of the auth handler
+            context: TurnContext for the operation
+            auth_token: Pre-acquired token from client credentials (production)
+        """
         if self.mcp_servers_initialized:
+            logger.info("✅ MCP servers already initialized")
             return
-
+        
+        logger.info("🚀 Starting MCP server initialization at startup...")
+        init_start = asyncio.get_event_loop().time()
+        
         try:
             if not self.tool_service:
-                logger.warning("⚠️ MCP tool service unavailable")
-                return
+                raise RuntimeError("MCP tool service unavailable")
 
-            use_agentic_auth = os.getenv("USE_AGENTIC_AUTH", "false").lower() == "true"
+            # Determine which token to use:
+            # 1. Passed auth_token (from client credentials at startup)
+            # 2. Bearer token from environment (dev mode)
+            effective_token = auth_token or self.auth_options.bearer_token
+            
+            if not effective_token:
+                raise RuntimeError("No auth token available for MCP initialization")
+            
+            logger.info(f"🔐 Using {'client credentials' if auth_token else 'environment'} token for MCP init")
 
-            if use_agentic_auth:
-                self.agent = await self.tool_service.add_tool_servers_to_agent(
-                    chat_client=self.chat_client,
-                    agent_instructions=self.AGENT_PROMPT,
-                    initial_tools=[],
-                    auth=auth,
-                    auth_handler_name=auth_handler_name,
-                    turn_context=context,
-                )
-            else:
-                self.agent = await self.tool_service.add_tool_servers_to_agent(
-                    chat_client=self.chat_client,
-                    agent_instructions=self.AGENT_PROMPT,
-                    initial_tools=[],
-                    auth=auth,
-                    auth_handler_name=auth_handler_name,
-                    auth_token=self.auth_options.bearer_token,
-                    turn_context=context,
-                )
+            self.agent = await self.tool_service.add_tool_servers_to_agent(
+                chat_client=self.chat_client,
+                agent_instructions=self.AGENT_PROMPT,
+                initial_tools=[],
+                auth=auth,
+                auth_handler_name=auth_handler_name,
+                auth_token=effective_token,
+                turn_context=context,
+            )
 
+            init_duration = asyncio.get_event_loop().time() - init_start
+            
             if self.agent:
-                logger.info("✅ MCP setup completed")
                 self.mcp_servers_initialized = True
+                logger.info(f"✅ MCP initialization completed in {init_duration:.1f}s - ALL SERVERS READY")
             else:
-                logger.warning("⚠️ MCP setup failed")
-
+                raise RuntimeError("MCP setup returned None agent")
+                
         except Exception as e:
-            logger.error(f"MCP setup error: {e}")
+            self._mcp_init_error = str(e)
+            logger.error(f"❌ MCP startup initialization failed: {e}")
+            raise
+
+    def ensure_mcp_ready(self):
+        """Check that MCPs are initialized. Called before processing requests."""
+        if not self.mcp_servers_initialized:
+            raise RuntimeError(
+                f"MCP servers not initialized. Error: {self._mcp_init_error or 'Unknown'}"
+            )
+
+    async def initialize_mcp_on_first_request(
+        self, auth: Authorization, auth_handler_name: Optional[str], context: TurnContext
+    ):
+        """
+        Initialize MCP servers on first request (fallback for production agentic auth).
+        
+        In production with agentic auth, client credentials cannot acquire MCP tokens.
+        The token must come from the agentic user token exchange, which requires a real
+        user request context. This method handles that case.
+        """
+        if self.mcp_servers_initialized:
+            return  # Already initialized
+        
+        logger.info("🔄 Initializing MCP servers on first request (agentic auth flow)...")
+        init_start = asyncio.get_event_loop().time()
+        
+        try:
+            if not self.tool_service:
+                raise RuntimeError("MCP tool service unavailable")
+
+            # In agentic auth mode, let the SDK handle token exchange
+            self.agent = await self.tool_service.add_tool_servers_to_agent(
+                chat_client=self.chat_client,
+                agent_instructions=self.AGENT_PROMPT,
+                initial_tools=[],
+                auth=auth,
+                auth_handler_name=auth_handler_name,
+                turn_context=context,
+                # No auth_token - SDK will do agentic token exchange
+            )
+
+            init_duration = asyncio.get_event_loop().time() - init_start
+            
+            if self.agent:
+                self.mcp_servers_initialized = True
+                logger.info(f"✅ MCP initialization completed in {init_duration:.1f}s - ALL SERVERS READY")
+            else:
+                raise RuntimeError("MCP setup returned None agent")
+                
+        except Exception as e:
+            self._mcp_init_error = str(e)
+            logger.error(f"❌ MCP first-request initialization failed: {e}")
+            raise
 
     # </McpServerSetup>
 
@@ -408,7 +487,10 @@ class AgentFrameworkAgent(AgentInterface):
     ) -> str:
         """Process user message using the AgentFramework SDK"""
         try:
-            await self.setup_mcp_servers(auth, auth_handler_name, context)
+            # If MCPs weren't initialized at startup (production agentic auth),
+            # initialize them now using the user's request context
+            if not self.mcp_servers_initialized:
+                await self.initialize_mcp_on_first_request(auth, auth_handler_name, context)
             
             # Add timeout to prevent infinite waiting on tool calls
             async with asyncio.timeout(self.PROCESSING_TIMEOUT):
@@ -445,6 +527,9 @@ class AgentFrameworkAgent(AgentInterface):
     # -------------------------------------------------------------------------
     # EMAIL NOTIFICATION HANDLER
     # -------------------------------------------------------------------------
+    
+    # Shorter timeout for email notifications (email channel has strict limits)
+    EMAIL_PROCESSING_TIMEOUT = 20  # seconds - must be less than channel timeout (~30s)
 
     async def handle_email_notification(
         self, notification_activity, auth: Authorization, auth_handler_name: Optional[str], context: TurnContext
@@ -454,15 +539,21 @@ class AgentFrameworkAgent(AgentInterface):
         
         Triggered when the agent receives an email where they are mentioned or addressed.
         Sub-channel: 'email'
+        
+        IMPORTANT: Email notifications have strict timeouts (~30s). We need to:
+        1. Skip MCP server initialization for simple replies (too slow)
+        2. Use a shorter timeout
+        3. Provide fast, helpful responses without complex tool usage
         """
         try:
-            logger.info("📧 Processing EMAIL notification")
+            logger.info("📧 Processing EMAIL notification (fast path)")
             
-            # Setup MCP servers on first call
-            await self.setup_mcp_servers(auth, auth_handler_name, context)
+            # For email notifications, we skip MCP initialization to respond faster
+            # The email channel has a strict timeout, and loading 8 MCP servers takes too long
+            # Instead, we use the agent without tools for a quick, helpful response
 
             if not hasattr(notification_activity, "email") or not notification_activity.email:
-                return "I could not find the email notification details."
+                return "Thank you for your email. I'll review it and get back to you."
 
             email = notification_activity.email
             email_body = getattr(email, "html_body", "") or getattr(email, "body", "")
@@ -472,32 +563,36 @@ class AgentFrameworkAgent(AgentInterface):
             if email:
                 logger.info(f"📧 Email html_body preview: {email_body[:100] if email_body else 'None'}...")
             
-            # Provide clear instructions to the LLM about email reply handling
-            message = f"""You have received the following email. Read the email content and write a helpful reply.
+            # Create a simple prompt for fast email response (no tool usage)
+            message = f"""You have received the following email. Write a brief, helpful reply.
 
-IMPORTANT: Your response will be sent directly as an email reply. Do NOT use mail tools to reply - just write your response text.
+IMPORTANT INSTRUCTIONS:
+- DO NOT use any tools - just write a direct response
+- Keep your response concise and professional
+- If the email requires action you can't do immediately, acknowledge it and say you'll follow up
 
 EMAIL CONTENT:
 {email_body}
 
-Write your reply to this email:"""
+Write your reply:"""
             
-            logger.info(f"🤖 Sending to LLM: {message[:200]}...")
+            logger.info(f"🤖 Sending to LLM (no tools): {message[:150]}...")
             
-            # Add timeout to prevent infinite waiting on tool calls
-            async with asyncio.timeout(self.PROCESSING_TIMEOUT):
-                result = await self.agent.run(message)
+            # Use a shorter timeout for email processing
+            try:
+                async with asyncio.timeout(self.EMAIL_PROCESSING_TIMEOUT):
+                    result = await self.agent.run(message)
+            except asyncio.TimeoutError:
+                logger.warning(f"Email LLM call timeout after {self.EMAIL_PROCESSING_TIMEOUT}s")
+                return "Thank you for your email. I've received it and will review the details shortly."
                 
-            response_text = self._extract_result(result) or "Thank you for your email."
+            response_text = self._extract_result(result) or "Thank you for your email. I'll get back to you soon."
             logger.info(f"🤖 LLM Response: {response_text[:200]}...")
             return response_text
 
-        except asyncio.TimeoutError:
-            logger.error(f"Email notification processing timeout after {self.PROCESSING_TIMEOUT}s")
-            return "Sorry, the request took too long to process. Please try again."
         except Exception as e:
             logger.error(f"Error processing email notification: {e}")
-            return f"Sorry, I encountered an error processing the email: {str(e)}"
+            return "Thank you for your email. I encountered an issue but will review your message."
 
     # -------------------------------------------------------------------------
     # WORD NOTIFICATION HANDLER
