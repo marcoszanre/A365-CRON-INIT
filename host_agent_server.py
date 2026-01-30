@@ -6,6 +6,7 @@
 import logging
 import os
 import socket
+import uuid
 from os import environ
 
 from aiohttp.web import Application, Request, Response, json_response, run_app
@@ -44,7 +45,7 @@ from microsoft_agents_a365.observability.core.middleware.baggage_builder import 
 from microsoft_agents_a365.runtime.environment_utils import (
     get_observability_authentication_scope,
 )
-from token_cache import cache_agentic_token
+from token_cache import cache_agentic_token, get_cached_agentic_token
 
 # --- Configuration ---
 ms_agents_logger = logging.getLogger("microsoft_agents")
@@ -60,6 +61,31 @@ load_dotenv()
 agents_sdk_config = load_configuration_from_env(environ)
 
 
+# --- Token Resolver for Observability ---
+def observability_token_resolver(agent_id: str, tenant_id: str) -> str | None:
+    """
+    Token resolver for Agent 365 Observability exporter.
+    
+    This function is called by the observability SDK to retrieve authentication
+    tokens for exporting telemetry to the Agent 365 service.
+    
+    Args:
+        agent_id: The unique identifier for the AI agent
+        tenant_id: The tenant ID for the agent
+        
+    Returns:
+        The cached agentic token, or None if not available
+    """
+    try:
+        cached_token = get_cached_agentic_token(tenant_id, agent_id)
+        if not cached_token:
+            logger.debug(f"No cached observability token for agent {agent_id}, tenant {tenant_id}")
+        return cached_token
+    except Exception as e:
+        logger.error(f"Error resolving observability token: {e}")
+        return None
+
+
 # --- Public API ---
 def create_and_run_host(
     agent_class: type[AgentInterface], *agent_args, **agent_kwargs
@@ -73,6 +99,7 @@ def create_and_run_host(
     configure(
         service_name="AgentFrameworkTracingWithAzureOpenAI",
         service_namespace="AgentFrameworkTesting",
+        token_resolver=observability_token_resolver,
     )
 
     host = GenericAgentHost(agent_class, *agent_args, **agent_kwargs)
@@ -148,10 +175,19 @@ class GenericAgentHost:
             logger.warning(f"⚠️ Failed to cache observability token: {e}")
 
     async def _validate_agent_and_setup_context(self, context: TurnContext):
+        """Validate agent instance and setup observability context.
+        
+        Returns:
+            Tuple of (tenant_id, agent_id, correlation_id) or None if validation fails
+        """
         logger.info("🔍 Validating agent and setting up context...")
         tenant_id = context.activity.recipient.tenant_id
         agent_id = context.activity.recipient.agentic_app_id
-        logger.info(f"🔍 tenant_id={tenant_id}, agent_id={agent_id}")
+        
+        # Generate correlation_id from activity.id or create a new UUID
+        correlation_id = context.activity.id or str(uuid.uuid4())
+        
+        logger.info(f"🔍 tenant_id={tenant_id}, agent_id={agent_id}, correlation_id={correlation_id}")
 
         if not self.agent_instance:
             logger.error("Agent not available")
@@ -159,7 +195,7 @@ class GenericAgentHost:
             return None
 
         await self._setup_observability_token(context, tenant_id, agent_id)
-        return tenant_id, agent_id
+        return tenant_id, agent_id, correlation_id
 
     # --- Handlers (Messages & Notifications) ---
     def _setup_handlers(self):
@@ -193,9 +229,9 @@ class GenericAgentHost:
                 result = await self._validate_agent_and_setup_context(context)
                 if result is None:
                     return
-                tenant_id, agent_id = result
+                tenant_id, agent_id, correlation_id = result
 
-                with BaggageBuilder().tenant_id(tenant_id).agent_id(agent_id).build():
+                with BaggageBuilder().tenant_id(tenant_id).agent_id(agent_id).correlation_id(correlation_id).build():
                     logger.info("📧 EMAIL notification received")
 
                     if not hasattr(self.agent_instance, "handle_email_notification"):
@@ -228,9 +264,9 @@ class GenericAgentHost:
                 result = await self._validate_agent_and_setup_context(context)
                 if result is None:
                     return
-                tenant_id, agent_id = result
+                tenant_id, agent_id, correlation_id = result
 
-                with BaggageBuilder().tenant_id(tenant_id).agent_id(agent_id).build():
+                with BaggageBuilder().tenant_id(tenant_id).agent_id(agent_id).correlation_id(correlation_id).build():
                     logger.info("📄 WORD comment notification received")
 
                     if not hasattr(self.agent_instance, "handle_word_notification"):
@@ -261,9 +297,9 @@ class GenericAgentHost:
                 result = await self._validate_agent_and_setup_context(context)
                 if result is None:
                     return
-                tenant_id, agent_id = result
+                tenant_id, agent_id, correlation_id = result
 
-                with BaggageBuilder().tenant_id(tenant_id).agent_id(agent_id).build():
+                with BaggageBuilder().tenant_id(tenant_id).agent_id(agent_id).correlation_id(correlation_id).build():
                     logger.info("📊 EXCEL comment notification received")
 
                     if not hasattr(self.agent_instance, "handle_excel_notification"):
@@ -294,9 +330,9 @@ class GenericAgentHost:
                 result = await self._validate_agent_and_setup_context(context)
                 if result is None:
                     return
-                tenant_id, agent_id = result
+                tenant_id, agent_id, correlation_id = result
 
-                with BaggageBuilder().tenant_id(tenant_id).agent_id(agent_id).build():
+                with BaggageBuilder().tenant_id(tenant_id).agent_id(agent_id).correlation_id(correlation_id).build():
                     logger.info("📽️ POWERPOINT comment notification received")
 
                     if not hasattr(self.agent_instance, "handle_powerpoint_notification"):
@@ -327,9 +363,9 @@ class GenericAgentHost:
                 result = await self._validate_agent_and_setup_context(context)
                 if result is None:
                     return
-                tenant_id, agent_id = result
+                tenant_id, agent_id, correlation_id = result
 
-                with BaggageBuilder().tenant_id(tenant_id).agent_id(agent_id).build():
+                with BaggageBuilder().tenant_id(tenant_id).agent_id(agent_id).correlation_id(correlation_id).build():
                     logger.info("📋 LIFECYCLE notification received")
 
                     if not hasattr(self.agent_instance, "handle_lifecycle_notification"):
@@ -363,9 +399,9 @@ class GenericAgentHost:
                 result = await self._validate_agent_and_setup_context(context)
                 if result is None:
                     return
-                tenant_id, agent_id = result
+                tenant_id, agent_id, correlation_id = result
 
-                with BaggageBuilder().tenant_id(tenant_id).agent_id(agent_id).build():
+                with BaggageBuilder().tenant_id(tenant_id).agent_id(agent_id).correlation_id(correlation_id).build():
                     notification_type = notification_activity.notification_type
                     logger.info(f"📬 Generic notification received: {notification_type}")
 
@@ -387,9 +423,9 @@ class GenericAgentHost:
                 result = await self._validate_agent_and_setup_context(context)
                 if result is None:
                     return
-                tenant_id, agent_id = result
+                tenant_id, agent_id, correlation_id = result
 
-                with BaggageBuilder().tenant_id(tenant_id).agent_id(agent_id).build():
+                with BaggageBuilder().tenant_id(tenant_id).agent_id(agent_id).correlation_id(correlation_id).build():
                     user_message = context.activity.text or ""
                     if not user_message.strip() or user_message.strip() == "/help":
                         return
