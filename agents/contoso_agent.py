@@ -251,62 +251,33 @@ When you receive Word/Excel/PowerPoint comment notifications:
     # NOTIFICATION HANDLERS
     # =========================================================================
     
-    def _extract_email_notification_data(self, context: TurnContext, notification_activity) -> dict:
-        """Extract email notification data from activity and entities."""
-        data = {
-            "sender_email": "",
-            "subject": "",
-            "message_id": "",
-            "conversation_id": "",
-            "html_body": "",
-            "text": "",
-        }
-        
-        # Get from activity.from
-        if context.activity.from_property:
-            data["sender_email"] = getattr(context.activity.from_property, "id", "") or ""
-        
-        # Get subject from conversation.topic
+    def _is_comment_notification_email(self, context: TurnContext) -> bool:
+        """Check if this email is just a notification about a document comment (duplicate)."""
+        # Check if it's from the email channel but contains document comment indicators
+        subject = ""
         if context.activity.conversation:
-            data["subject"] = getattr(context.activity.conversation, "topic", "") or ""
+            subject = getattr(context.activity.conversation, "topic", "") or ""
         
-        # Get message ID from activity.id
-        data["message_id"] = getattr(context.activity, "id", "") or ""
+        # These are notification emails about document comments - we already handle the actual comment
+        # Check for patterns like "mentioned you in" which indicate it's a notification email
+        if "mentioned you in" in subject.lower():
+            # Check if there's a wpxcomment or document reference in the HTML that indicates
+            # this is a notification about a comment we'll get separately
+            entities = getattr(context.activity, "entities", []) or []
+            for entity in entities:
+                entity_type = getattr(entity, "type", "") if hasattr(entity, "type") else entity.get("type", "")
+                if entity_type == "emailNotification":
+                    html_body = ""
+                    if hasattr(entity, "htmlBody"):
+                        html_body = entity.htmlBody
+                    elif isinstance(entity, dict):
+                        html_body = entity.get("htmlBody", "")
+                    
+                    # If the HTML contains "Go to comment" it's a notification email about a document comment
+                    if html_body and "Go to comment" in html_body:
+                        return True
         
-        # Get text content
-        data["text"] = getattr(context.activity, "text", "") or ""
-        
-        # Try to get htmlBody from emailNotification entity
-        entities = getattr(context.activity, "entities", []) or []
-        for entity in entities:
-            entity_type = getattr(entity, "type", "") if hasattr(entity, "type") else entity.get("type", "")
-            if entity_type == "emailNotification":
-                # Get htmlBody
-                if hasattr(entity, "html_body"):
-                    data["html_body"] = entity.html_body
-                elif hasattr(entity, "htmlBody"):
-                    data["html_body"] = entity.htmlBody
-                elif isinstance(entity, dict):
-                    data["html_body"] = entity.get("htmlBody", "") or entity.get("html_body", "")
-                
-                # Get conversationId
-                if hasattr(entity, "conversation_id"):
-                    data["conversation_id"] = entity.conversation_id
-                elif hasattr(entity, "conversationId"):
-                    data["conversation_id"] = entity.conversationId
-                elif isinstance(entity, dict):
-                    data["conversation_id"] = entity.get("conversationId", "") or entity.get("conversation_id", "")
-                break
-        
-        # Also try from notification_activity.email if available
-        if hasattr(notification_activity, "email") and notification_activity.email:
-            email = notification_activity.email
-            if not data["html_body"]:
-                data["html_body"] = getattr(email, "html_body", "") or getattr(email, "htmlBody", "") or ""
-            if not data["sender_email"]:
-                data["sender_email"] = getattr(email, "from_address", "") or getattr(email, "sender", "") or ""
-        
-        return data
+        return False
     
     async def handle_email_notification(
         self,
@@ -315,47 +286,64 @@ When you receive Word/Excel/PowerPoint comment notifications:
         auth_handler_name: Optional[str],
         context: TurnContext,
     ) -> str:
-        """Handle email notifications using Mail MCP to send replies."""
+        """Handle email notifications intelligently using AI to decide the best response."""
         try:
             logger.info("📧 Processing email notification")
             
-            # Extract email data from activity and entities
-            email_data = self._extract_email_notification_data(context, notification_activity)
+            # Check if this is a duplicate notification email about a document comment
+            if self._is_comment_notification_email(context):
+                logger.info("📧 Skipping duplicate comment notification email (handled via document comment)")
+                return "This notification has been noted."
             
-            sender_email = email_data["sender_email"]
-            subject = email_data["subject"]
-            message_id = email_data["message_id"]
-            conversation_id = email_data["conversation_id"]
-            html_body = email_data["html_body"]
-            text_content = email_data["text"]
+            # Extract email data
+            sender_email = ""
+            subject = ""
+            text_content = getattr(context.activity, "text", "") or ""
+            html_body = ""
             
-            # Use html_body if available, otherwise fall back to text
-            email_content = html_body if html_body else text_content
+            if context.activity.from_property:
+                sender_email = getattr(context.activity.from_property, "id", "") or ""
+            
+            if context.activity.conversation:
+                subject = getattr(context.activity.conversation, "topic", "") or ""
+            
+            # Get htmlBody from emailNotification entity
+            entities = getattr(context.activity, "entities", []) or []
+            for entity in entities:
+                entity_type = getattr(entity, "type", "") if hasattr(entity, "type") else entity.get("type", "")
+                if entity_type == "emailNotification":
+                    if hasattr(entity, "htmlBody"):
+                        html_body = entity.htmlBody
+                    elif isinstance(entity, dict):
+                        html_body = entity.get("htmlBody", "")
+                    break
+            
+            # Use the best available content
+            email_content = html_body[:3000] if html_body else text_content[:3000]
             
             logger.info(f"📧 From: {sender_email}, Subject: {subject}")
             
-            # Initialize MCP for Mail tools access
+            # Initialize MCP for full tool access
             await self._ensure_mcp_initialized(auth, auth_handler_name, context)
             
-            # Use the Mail MCP to send a proper reply
-            message = f"""You received an email notification and need to reply to it.
+            # Let the AI decide what to do based on the email content
+            message = f"""You received an email. Analyze it and respond appropriately.
 
 FROM: {sender_email}
 SUBJECT: {subject}
-MESSAGE ID: {message_id}
-CONVERSATION ID: {conversation_id}
 
 EMAIL CONTENT:
-{email_content[:2000]}
+{email_content}
 
 INSTRUCTIONS:
-1. Compose a helpful, professional reply to this email.
-2. Use the Mail tools (mcp_MailTools) to send your reply.
-3. If there's a replyToEmail function with message ID support, use that.
-4. Otherwise, use sendEmail to send to {sender_email} with subject "Re: {subject}".
-5. Keep your reply concise and helpful.
+- Analyze what the sender is asking or telling you
+- If they're asking a question, answer it directly
+- If they're asking you to do something (send email, schedule meeting, look up info, etc.), USE YOUR TOOLS to do it
+- If they want you to reply via email, use the Mail tools to send a reply
+- If it's just informational with no action needed, acknowledge it briefly
+- Be helpful and take action when appropriate
 
-Send the reply now using the mail tools."""
+Respond and take any necessary actions."""
             
             try:
                 async with asyncio.timeout(self.PROCESSING_TIMEOUT):
@@ -380,39 +368,40 @@ Send the reply now using the mail tools."""
         auth_handler_name: Optional[str],
         context: TurnContext,
     ) -> str:
-        """Handle Word document comment notifications."""
+        """Handle Word document comment notifications - let AI decide what to do."""
         try:
             logger.info("📄 Processing Word notification")
             
-            # Initialize MCP for tool access
+            # Initialize MCP for full tool access - the user might ask for anything!
             await self._ensure_mcp_initialized(auth, auth_handler_name, context)
             
-            # Get comment text from the activity (not from notification_activity)
+            # Get the comment text and context
             comment_text = getattr(context.activity, "text", "") or ""
-            # Clean up the @mention
             comment_text = comment_text.replace("<at>", "").replace("</at>", "").strip()
             
-            # Get document info from wpx_comment if available
-            doc_id = ""
-            comment_id = ""
             doc_name = getattr(context.activity.conversation, "topic", "") or "Document"
+            sender_name = ""
+            if context.activity.from_property:
+                sender_name = getattr(context.activity.from_property, "name", "") or ""
             
-            if hasattr(notification_activity, "wpx_comment") and notification_activity.wpx_comment:
-                wpx = notification_activity.wpx_comment
-                doc_id = getattr(wpx, "document_id", "")
-                comment_id = getattr(wpx, "comment_id", "") or getattr(wpx, "initiating_comment_id", "")
-            
-            logger.info(f"📄 Word comment: '{comment_text[:50]}...' on '{doc_name}'")
+            logger.info(f"📄 Word comment from {sender_name}: '{comment_text[:50]}...'")
             
             async with asyncio.timeout(self.PROCESSING_TIMEOUT):
-                message = f"""You have a comment on a Word document that you need to respond to.
+                message = f"""Someone commented on a Word document and mentioned you.
 
 DOCUMENT: {doc_name}
-DOCUMENT ID: {doc_id}
-COMMENT ID: {comment_id}
-COMMENT TEXT: '{comment_text}'
+FROM: {sender_name}
+COMMENT: "{comment_text}"
 
-Provide a helpful, direct response to this comment. Your response will be posted as a reply to the comment."""
+INSTRUCTIONS:
+- Analyze what they're asking or saying
+- If it's a question (like "what is geography?"), answer it directly and clearly
+- If they're asking you to do something (send email, look up info, schedule meeting, etc.), USE YOUR TOOLS to do it
+- If they reference the document content, help with that
+- Your response will be posted as a reply to their comment
+- Be helpful, concise, and take action when needed
+
+Respond appropriately:"""
                 
                 result = await self.agent.run(message)
             
@@ -431,37 +420,41 @@ Provide a helpful, direct response to this comment. Your response will be posted
         auth_handler_name: Optional[str],
         context: TurnContext,
     ) -> str:
-        """Handle Excel document comment notifications."""
+        """Handle Excel document comment notifications - let AI decide what to do."""
         try:
             logger.info("📊 Processing Excel notification")
             
+            # Initialize MCP for full tool access - the user might ask for anything!
             await self._ensure_mcp_initialized(auth, auth_handler_name, context)
             
-            # Get comment text from the activity
+            # Get the comment text and context
             comment_text = getattr(context.activity, "text", "") or ""
-            comment_text = comment_text.replace("<at>", "").replace("</at>", "").strip()
+            # Excel uses @ mentions without <at> tags
+            comment_text = comment_text.strip()
             
-            # Get document info
             doc_name = getattr(context.activity.conversation, "topic", "") or "Spreadsheet"
-            doc_id = ""
-            comment_id = ""
+            sender_name = ""
+            if context.activity.from_property:
+                sender_name = getattr(context.activity.from_property, "name", "") or ""
             
-            if hasattr(notification_activity, "wpx_comment") and notification_activity.wpx_comment:
-                wpx = notification_activity.wpx_comment
-                doc_id = getattr(wpx, "document_id", "")
-                comment_id = getattr(wpx, "comment_id", "") or getattr(wpx, "initiating_comment_id", "")
-            
-            logger.info(f"📊 Excel comment: '{comment_text[:50]}...' on '{doc_name}'")
+            logger.info(f"📊 Excel comment from {sender_name}: '{comment_text[:50]}...'")
             
             async with asyncio.timeout(self.PROCESSING_TIMEOUT):
-                message = f"""You have a comment on an Excel spreadsheet that you need to respond to.
+                message = f"""Someone commented on an Excel spreadsheet and mentioned you.
 
-DOCUMENT: {doc_name}
-DOCUMENT ID: {doc_id}
-COMMENT ID: {comment_id}
-COMMENT TEXT: '{comment_text}'
+SPREADSHEET: {doc_name}
+FROM: {sender_name}
+COMMENT: "{comment_text}"
 
-Provide a helpful, direct response to this comment. Your response will be posted as a reply to the comment."""
+INSTRUCTIONS:
+- Analyze what they're asking or saying
+- If it's a question (like "what is geography?"), answer it directly and clearly
+- If they're asking you to do something (send email, look up info, analyze data, etc.), USE YOUR TOOLS to do it
+- If they reference the spreadsheet data, help with that
+- Your response will be posted as a reply to their comment
+- Be helpful, concise, and take action when needed
+
+Respond appropriately:"""
                 
                 result = await self.agent.run(message)
             
@@ -480,37 +473,40 @@ Provide a helpful, direct response to this comment. Your response will be posted
         auth_handler_name: Optional[str],
         context: TurnContext,
     ) -> str:
-        """Handle PowerPoint document comment notifications."""
+        """Handle PowerPoint document comment notifications - let AI decide what to do."""
         try:
             logger.info("📽️ Processing PowerPoint notification")
             
+            # Initialize MCP for full tool access - the user might ask for anything!
             await self._ensure_mcp_initialized(auth, auth_handler_name, context)
             
-            # Get comment text from the activity
+            # Get the comment text and context
             comment_text = getattr(context.activity, "text", "") or ""
             comment_text = comment_text.replace("<at>", "").replace("</at>", "").strip()
             
-            # Get document info
             doc_name = getattr(context.activity.conversation, "topic", "") or "Presentation"
-            doc_id = ""
-            comment_id = ""
+            sender_name = ""
+            if context.activity.from_property:
+                sender_name = getattr(context.activity.from_property, "name", "") or ""
             
-            if hasattr(notification_activity, "wpx_comment") and notification_activity.wpx_comment:
-                wpx = notification_activity.wpx_comment
-                doc_id = getattr(wpx, "document_id", "")
-                comment_id = getattr(wpx, "comment_id", "") or getattr(wpx, "initiating_comment_id", "")
-            
-            logger.info(f"📽️ PowerPoint comment: '{comment_text[:50]}...' on '{doc_name}'")
+            logger.info(f"📽️ PowerPoint comment from {sender_name}: '{comment_text[:50]}...'")
             
             async with asyncio.timeout(self.PROCESSING_TIMEOUT):
-                message = f"""You have a comment on a PowerPoint presentation that you need to respond to.
+                message = f"""Someone commented on a PowerPoint presentation and mentioned you.
 
-DOCUMENT: {doc_name}
-DOCUMENT ID: {doc_id}
-COMMENT ID: {comment_id}
-COMMENT TEXT: '{comment_text}'
+PRESENTATION: {doc_name}
+FROM: {sender_name}
+COMMENT: "{comment_text}"
 
-Provide a helpful, direct response to this comment. Your response will be posted as a reply to the comment."""
+INSTRUCTIONS:
+- Analyze what they're asking or saying
+- If it's a question (like "what is geography?"), answer it directly and clearly
+- If they're asking you to do something (send email, look up info, etc.), USE YOUR TOOLS to do it
+- If they reference the presentation content, help with that
+- Your response will be posted as a reply to their comment
+- Be helpful, concise, and take action when needed
+
+Respond appropriately:"""
                 
                 result = await self.agent.run(message)
             
