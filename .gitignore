@@ -76,3 +76,4 @@ manifest/manifest.zip
 
 # Token cache
 token_cache.bin
+.env.dev

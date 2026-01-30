@@ -1,13 +1,14 @@
+
 {
   "$schema": "https://developer.microsoft.com/en-us/json-schemas/teams/vdevPreview/MicrosoftTeams.schema.json",
-  "id": "c56ae7ae-bab3-4215-8441-b84dcb6afece",
+  "id": "ccaa3a30-08b3-4f2e-b589-f00899af728b",
   "name": {
-    "short": "marcoszanragent0128 Blueprint",
-    "full": "marcoszanragent0128 Blueprint"
+    "short": "MZHEROPYTHON Blueprint",
+    "full": "MZHEROPYTHON Blueprint"
   },
   "description": {
-    "short": "A brief description of what your agent does.",
-    "full": "A comprehensive description of your agent\u0027s capabilities and purpose. Explain what problems it solves, what data it can access, and how users will interact with it. This description helps users understand when and how to use your agent effectively."
+    "short": "AI assistant for M365 with email, docs and Teams.",
+    "full": "MZHEROPYTHON Agent is an intelligent AI assistant powered by Azure OpenAI that helps you work smarter with Microsoft 365. It can read and send emails, create and edit Word documents, search SharePoint, interact with Teams, and respond to document notifications. Built with the Agent 365 framework for seamless M365 integration."
   },
   "icons": {
     "outline": "outline.png",

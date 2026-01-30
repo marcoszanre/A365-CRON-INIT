@@ -545,15 +545,31 @@ Please analyze the context and provide a helpful response. If needed, you can re
         
         These events allow agents to perform initialization tasks, cleanup operations,
         or state management in response to user lifecycle changes.
+        
+        Note: Lifecycle notifications store event data in notification.value or notification.activity,
+        not in a dedicated typed property like email or wpx_comment.
         """
         try:
             logger.info("📋 Processing LIFECYCLE notification")
             
-            # Get the lifecycle notification data
-            lifecycle_notification = getattr(notification_activity, 'agent_lifecycle_notification', None)
+            # Get the lifecycle event type from the activity name
+            # The notification_type is AGENT_LIFECYCLE, but event details are in activity.name or activity.value
+            event_type = None
             
-            if lifecycle_notification:
-                event_type = getattr(lifecycle_notification, 'lifecycle_event_type', None)
+            # Try to get event type from activity.name (e.g., "agenticUserIdentityCreated")
+            if hasattr(notification_activity, 'activity') and notification_activity.activity:
+                event_type = getattr(notification_activity.activity, 'name', None)
+                logger.info(f"📋 Activity name: {event_type}")
+            
+            # Also check notification_activity.value for additional data
+            value_data = getattr(notification_activity, 'value', None)
+            if value_data:
+                logger.info(f"📋 Lifecycle value data: {value_data}")
+                # If value is a dict, try to extract lifecycle_event_type
+                if isinstance(value_data, dict):
+                    event_type = value_data.get('lifecycle_event_type', event_type) or value_data.get('lifecycleEventType', event_type)
+            
+            if event_type:
                 logger.info(f"📋 Agent lifecycle event: {event_type}")
                 
                 if event_type == "agenticUserIdentityCreated":
@@ -575,7 +591,10 @@ Please analyze the context and provide a helpful response. If needed, you can re
                     logger.info(f"📋 Unknown lifecycle event type: {event_type}")
                     return f"Lifecycle event '{event_type}' acknowledged."
             else:
-                logger.info("📋 Lifecycle notification received (no detailed data available)")
+                logger.info("📋 Lifecycle notification received (no event type found)")
+                # Log available attributes for debugging
+                attrs = [attr for attr in dir(notification_activity) if not attr.startswith('_')]
+                logger.debug(f"📋 Available notification attributes: {attrs}")
                 return "Agent lifecycle event acknowledged."
                 
         except Exception as e:

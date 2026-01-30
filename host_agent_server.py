@@ -457,9 +457,18 @@ class GenericAgentHost:
 
     # --- Authentication ---
     def create_auth_configuration(self) -> AgentAuthConfiguration | None:
-        client_id = environ.get("CLIENT_ID")
-        tenant_id = environ.get("TENANT_ID")
-        client_secret = environ.get("CLIENT_SECRET")
+        # First try the consolidated CONNECTIONS__SERVICE_CONNECTION env vars (preferred)
+        client_id = environ.get("CONNECTIONS__SERVICE_CONNECTION__SETTINGS__CLIENTID")
+        tenant_id = environ.get("CONNECTIONS__SERVICE_CONNECTION__SETTINGS__TENANTID")
+        client_secret = environ.get("CONNECTIONS__SERVICE_CONNECTION__SETTINGS__CLIENTSECRET")
+        
+        # Fall back to legacy env vars if CONNECTIONS vars not set
+        if not client_id:
+            client_id = environ.get("CLIENT_ID")
+        if not tenant_id:
+            tenant_id = environ.get("TENANT_ID")
+        if not client_secret:
+            client_secret = environ.get("CLIENT_SECRET")
 
         if client_id and tenant_id and client_secret:
             logger.info("🔒 Using Client Credentials authentication")
