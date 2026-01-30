@@ -298,96 +298,6 @@ SECURITY RULES:
     # =========================================================================
     # <NotificationHandling>
 
-    async def handle_agent_notification_activity(
-        self, notification_activity, auth: Authorization, auth_handler_name: Optional[str], context: TurnContext
-    ) -> str:
-        """Handle agent notification activities (email, Word mentions, etc.)"""
-        try:
-            notification_type = notification_activity.notification_type
-            logger.info(f"📬 Processing notification: {notification_type}")
-            
-            # Debug: Log email entity status
-            email_obj = notification_activity.email
-            logger.info(f"📧 Email entity present: {email_obj is not None}")
-            if email_obj:
-                logger.info(f"📧 Email html_body: {getattr(email_obj, 'html_body', 'N/A')[:100] if getattr(email_obj, 'html_body', None) else 'None'}...")
-
-            # Setup MCP servers on first call
-            await self.setup_mcp_servers(auth, auth_handler_name, context)
-
-            # Handle Email Notifications
-            if notification_type == NotificationTypes.EMAIL_NOTIFICATION:
-                if not hasattr(notification_activity, "email") or not notification_activity.email:
-                    return "I could not find the email notification details."
-
-                email = notification_activity.email
-                email_body = getattr(email, "html_body", "") or getattr(email, "body", "")
-                
-                # Provide clear instructions to the LLM about email reply handling
-                message = f"""You have received the following email. Read the email content and write a helpful reply.
-
-IMPORTANT: Your response will be sent directly as an email reply. Do NOT use mail tools to reply - just write your response text.
-
-EMAIL CONTENT:
-{email_body}
-
-Write your reply to this email:"""
-                
-                logger.info(f"🤖 Sending to LLM: {message[:200]}...")
-                
-                # Add timeout to prevent infinite waiting on tool calls
-                async with asyncio.timeout(self.PROCESSING_TIMEOUT):
-                    result = await self.agent.run(message)
-                    
-                response_text = self._extract_result(result) or "Thank you for your email."
-                logger.info(f"🤖 LLM Response: {response_text[:200]}...")
-                return response_text
-
-            # Handle Word Comment Notifications
-            elif notification_type == NotificationTypes.WPX_COMMENT:
-                if not hasattr(notification_activity, "wpx_comment") or not notification_activity.wpx_comment:
-                    return "I could not find the Word notification details."
-
-                wpx = notification_activity.wpx_comment
-                doc_id = getattr(wpx, "document_id", "")
-                comment_id = getattr(wpx, "initiating_comment_id", "")
-                drive_id = "default"
-
-                # Add timeout to prevent infinite waiting on tool calls
-                async with asyncio.timeout(self.PROCESSING_TIMEOUT):
-                    # Get Word document content
-                    doc_message = f"You have a new comment on the Word document with id '{doc_id}', comment id '{comment_id}', drive id '{drive_id}'. Please retrieve the Word document as well as the comments and return it in text format."
-                    doc_result = await self.agent.run(doc_message)
-                    word_content = self._extract_result(doc_result)
-
-                    # Process the comment with document context
-                    comment_text = notification_activity.text or ""
-                    response_message = f"You have received the following Word document content and comments. Please refer to these when responding to comment '{comment_text}'. {word_content}"
-                    result = await self.agent.run(response_message)
-                    
-                return self._extract_result(result) or "Word notification processed."
-
-            # Handle Agent Lifecycle Notifications
-            elif notification_type == NotificationTypes.AGENT_LIFECYCLE:
-                return await self._handle_lifecycle_notification(notification_activity)
-
-            # Generic notification handling for unknown types
-            else:
-                notification_text = getattr(notification_activity, 'text', None)
-                if notification_text:
-                    result = await self.agent.run(notification_text)
-                    return self._extract_result(result) or "Notification processed successfully."
-                else:
-                    logger.info(f"📋 Notification type {notification_type} received with no text content")
-                    return f"Notification of type {notification_type} acknowledged."
-
-        except asyncio.TimeoutError:
-            logger.error(f"Notification processing timeout after {self.PROCESSING_TIMEOUT}s")
-            return "Sorry, the request took too long to process. Please try again."
-        except Exception as e:
-            logger.error(f"Error processing notification: {e}")
-            return f"Sorry, I encountered an error processing the notification: {str(e)}"
-
     def _extract_result(self, result) -> str:
         """Extract text content from agent result"""
         if not result:
@@ -401,7 +311,230 @@ Write your reply to this email:"""
         else:
             return str(result)
 
-    async def _handle_lifecycle_notification(self, notification_activity) -> str:
+    # -------------------------------------------------------------------------
+    # EMAIL NOTIFICATION HANDLER
+    # -------------------------------------------------------------------------
+
+    async def handle_email_notification(
+        self, notification_activity, auth: Authorization, auth_handler_name: Optional[str], context: TurnContext
+    ) -> str:
+        """
+        Handle email notifications.
+        
+        Triggered when the agent receives an email where they are mentioned or addressed.
+        Sub-channel: 'email'
+        """
+        try:
+            logger.info("📧 Processing EMAIL notification")
+            
+            # Setup MCP servers on first call
+            await self.setup_mcp_servers(auth, auth_handler_name, context)
+
+            if not hasattr(notification_activity, "email") or not notification_activity.email:
+                return "I could not find the email notification details."
+
+            email = notification_activity.email
+            email_body = getattr(email, "html_body", "") or getattr(email, "body", "")
+            
+            # Debug logging
+            logger.info(f"📧 Email entity present: {email is not None}")
+            if email:
+                logger.info(f"📧 Email html_body preview: {email_body[:100] if email_body else 'None'}...")
+            
+            # Provide clear instructions to the LLM about email reply handling
+            message = f"""You have received the following email. Read the email content and write a helpful reply.
+
+IMPORTANT: Your response will be sent directly as an email reply. Do NOT use mail tools to reply - just write your response text.
+
+EMAIL CONTENT:
+{email_body}
+
+Write your reply to this email:"""
+            
+            logger.info(f"🤖 Sending to LLM: {message[:200]}...")
+            
+            # Add timeout to prevent infinite waiting on tool calls
+            async with asyncio.timeout(self.PROCESSING_TIMEOUT):
+                result = await self.agent.run(message)
+                
+            response_text = self._extract_result(result) or "Thank you for your email."
+            logger.info(f"🤖 LLM Response: {response_text[:200]}...")
+            return response_text
+
+        except asyncio.TimeoutError:
+            logger.error(f"Email notification processing timeout after {self.PROCESSING_TIMEOUT}s")
+            return "Sorry, the request took too long to process. Please try again."
+        except Exception as e:
+            logger.error(f"Error processing email notification: {e}")
+            return f"Sorry, I encountered an error processing the email: {str(e)}"
+
+    # -------------------------------------------------------------------------
+    # WORD NOTIFICATION HANDLER
+    # -------------------------------------------------------------------------
+
+    async def handle_word_notification(
+        self, notification_activity, auth: Authorization, auth_handler_name: Optional[str], context: TurnContext
+    ) -> str:
+        """
+        Handle Word document comment notifications.
+        
+        Triggered when the agent is mentioned in a comment in a Word document.
+        Sub-channel: 'word'
+        """
+        try:
+            logger.info("📄 Processing WORD comment notification")
+            
+            # Setup MCP servers on first call
+            await self.setup_mcp_servers(auth, auth_handler_name, context)
+
+            if not hasattr(notification_activity, "wpx_comment") or not notification_activity.wpx_comment:
+                return "I could not find the Word comment notification details."
+
+            wpx = notification_activity.wpx_comment
+            doc_id = getattr(wpx, "document_id", "")
+            comment_id = getattr(wpx, "initiating_comment_id", "")
+            drive_id = getattr(wpx, "drive_id", "default")
+            comment_text = notification_activity.text or ""
+
+            logger.info(f"📄 Word document_id: {doc_id}, comment_id: {comment_id}")
+
+            # Add timeout to prevent infinite waiting on tool calls
+            async with asyncio.timeout(self.PROCESSING_TIMEOUT):
+                # Get Word document content and comments
+                doc_message = f"""You have a new comment on a Word document. Please help respond to it.
+
+Document ID: {doc_id}
+Comment ID: {comment_id}
+Drive ID: {drive_id}
+
+Please retrieve the Word document content and all comments, then provide a helpful response to the comment: '{comment_text}'"""
+                
+                result = await self.agent.run(doc_message)
+                
+            return self._extract_result(result) or "Word comment processed."
+
+        except asyncio.TimeoutError:
+            logger.error(f"Word notification processing timeout after {self.PROCESSING_TIMEOUT}s")
+            return "Sorry, the request took too long to process. Please try again."
+        except Exception as e:
+            logger.error(f"Error processing Word notification: {e}")
+            return f"Sorry, I encountered an error processing the Word comment: {str(e)}"
+
+    # -------------------------------------------------------------------------
+    # EXCEL NOTIFICATION HANDLER
+    # -------------------------------------------------------------------------
+
+    async def handle_excel_notification(
+        self, notification_activity, auth: Authorization, auth_handler_name: Optional[str], context: TurnContext
+    ) -> str:
+        """
+        Handle Excel document comment notifications.
+        
+        Triggered when the agent is mentioned in a comment in an Excel document.
+        Sub-channel: 'excel'
+        """
+        try:
+            logger.info("📊 Processing EXCEL comment notification")
+            
+            # Setup MCP servers on first call
+            await self.setup_mcp_servers(auth, auth_handler_name, context)
+
+            if not hasattr(notification_activity, "wpx_comment") or not notification_activity.wpx_comment:
+                return "I could not find the Excel comment notification details."
+
+            wpx = notification_activity.wpx_comment
+            doc_id = getattr(wpx, "document_id", "")
+            comment_id = getattr(wpx, "initiating_comment_id", "")
+            drive_id = getattr(wpx, "drive_id", "default")
+            comment_text = notification_activity.text or ""
+
+            logger.info(f"📊 Excel document_id: {doc_id}, comment_id: {comment_id}")
+
+            # Add timeout to prevent infinite waiting on tool calls
+            async with asyncio.timeout(self.PROCESSING_TIMEOUT):
+                # Excel-specific handling - could include cell references, formulas, etc.
+                doc_message = f"""You have a new comment on an Excel spreadsheet. Please help respond to it.
+
+Document ID: {doc_id}
+Comment ID: {comment_id}
+Drive ID: {drive_id}
+
+The user commented: '{comment_text}'
+
+Please analyze the context and provide a helpful response. If needed, you can retrieve the Excel document to understand the data context."""
+                
+                result = await self.agent.run(doc_message)
+                
+            return self._extract_result(result) or "Excel comment processed."
+
+        except asyncio.TimeoutError:
+            logger.error(f"Excel notification processing timeout after {self.PROCESSING_TIMEOUT}s")
+            return "Sorry, the request took too long to process. Please try again."
+        except Exception as e:
+            logger.error(f"Error processing Excel notification: {e}")
+            return f"Sorry, I encountered an error processing the Excel comment: {str(e)}"
+
+    # -------------------------------------------------------------------------
+    # POWERPOINT NOTIFICATION HANDLER
+    # -------------------------------------------------------------------------
+
+    async def handle_powerpoint_notification(
+        self, notification_activity, auth: Authorization, auth_handler_name: Optional[str], context: TurnContext
+    ) -> str:
+        """
+        Handle PowerPoint document comment notifications.
+        
+        Triggered when the agent is mentioned in a comment in a PowerPoint document.
+        Sub-channel: 'powerpoint'
+        """
+        try:
+            logger.info("📽️ Processing POWERPOINT comment notification")
+            
+            # Setup MCP servers on first call
+            await self.setup_mcp_servers(auth, auth_handler_name, context)
+
+            if not hasattr(notification_activity, "wpx_comment") or not notification_activity.wpx_comment:
+                return "I could not find the PowerPoint comment notification details."
+
+            wpx = notification_activity.wpx_comment
+            doc_id = getattr(wpx, "document_id", "")
+            comment_id = getattr(wpx, "initiating_comment_id", "")
+            drive_id = getattr(wpx, "drive_id", "default")
+            comment_text = notification_activity.text or ""
+
+            logger.info(f"📽️ PowerPoint document_id: {doc_id}, comment_id: {comment_id}")
+
+            # Add timeout to prevent infinite waiting on tool calls
+            async with asyncio.timeout(self.PROCESSING_TIMEOUT):
+                # PowerPoint-specific handling - could include slide context, presentation themes, etc.
+                doc_message = f"""You have a new comment on a PowerPoint presentation. Please help respond to it.
+
+Document ID: {doc_id}
+Comment ID: {comment_id}
+Drive ID: {drive_id}
+
+The user commented: '{comment_text}'
+
+Please analyze the context and provide a helpful response. If needed, you can retrieve the PowerPoint document to understand the presentation context."""
+                
+                result = await self.agent.run(doc_message)
+                
+            return self._extract_result(result) or "PowerPoint comment processed."
+
+        except asyncio.TimeoutError:
+            logger.error(f"PowerPoint notification processing timeout after {self.PROCESSING_TIMEOUT}s")
+            return "Sorry, the request took too long to process. Please try again."
+        except Exception as e:
+            logger.error(f"Error processing PowerPoint notification: {e}")
+            return f"Sorry, I encountered an error processing the PowerPoint comment: {str(e)}"
+
+    # -------------------------------------------------------------------------
+    # LIFECYCLE NOTIFICATION HANDLER
+    # -------------------------------------------------------------------------
+
+    async def handle_lifecycle_notification(
+        self, notification_activity, auth: Authorization, auth_handler_name: Optional[str], context: TurnContext
+    ) -> str:
         """
         Handle Agent Lifecycle notifications.
         
@@ -414,6 +547,8 @@ Write your reply to this email:"""
         or state management in response to user lifecycle changes.
         """
         try:
+            logger.info("📋 Processing LIFECYCLE notification")
+            
             # Get the lifecycle notification data
             lifecycle_notification = getattr(notification_activity, 'agent_lifecycle_notification', None)
             

@@ -36,6 +36,40 @@ class AgentInterface(ABC):
         """Clean up any resources used by the agent."""
         pass
 
+    # =========================================================================
+    # NOTIFICATION HANDLERS
+    # =========================================================================
+
+    async def handle_email_notification(
+        self, notification_activity, auth: Authorization, auth_handler_name: Optional[str], context: TurnContext
+    ) -> str:
+        """Handle email notification. Override to customize behavior."""
+        return "Email notification received."
+
+    async def handle_word_notification(
+        self, notification_activity, auth: Authorization, auth_handler_name: Optional[str], context: TurnContext
+    ) -> str:
+        """Handle Word document comment notification. Override to customize behavior."""
+        return "Word comment notification received."
+
+    async def handle_excel_notification(
+        self, notification_activity, auth: Authorization, auth_handler_name: Optional[str], context: TurnContext
+    ) -> str:
+        """Handle Excel document comment notification. Override to customize behavior."""
+        return "Excel comment notification received."
+
+    async def handle_powerpoint_notification(
+        self, notification_activity, auth: Authorization, auth_handler_name: Optional[str], context: TurnContext
+    ) -> str:
+        """Handle PowerPoint document comment notification. Override to customize behavior."""
+        return "PowerPoint comment notification received."
+
+    async def handle_lifecycle_notification(
+        self, notification_activity, auth: Authorization, auth_handler_name: Optional[str], context: TurnContext
+    ) -> str:
+        """Handle agent lifecycle notification. Override to customize behavior."""
+        return "Lifecycle notification received."
+
 
 def check_agent_inheritance(agent_class) -> bool:
     """

@@ -176,14 +176,15 @@ class GenericAgentHost:
         self.agent_app.conversation_update("membersAdded", **handler_config)(help_handler)
         self.agent_app.message("/help", **handler_config)(help_handler)
 
-        # IMPORTANT: Register notification handler BEFORE message handler!
-        # The SDK uses "first match wins" routing, so notification handler must come first
+        # IMPORTANT: Register notification handlers BEFORE message handler!
+        # The SDK uses "first match wins" routing, so notification handlers must come first
         # to catch activities with channelId="agents" before the generic message handler.
-        @self.agent_notification.on_agent_notification(
-            channel_id=ChannelId(channel="agents", sub_channel="*"),
-            **handler_config,
-        )
-        async def on_notification(
+
+        # =====================================================================
+        # EMAIL NOTIFICATION HANDLER
+        # =====================================================================
+        @self.agent_notification.on_email(**handler_config)
+        async def on_email_notification(
             context: TurnContext,
             state: TurnState,
             notification_activity: AgentNotificationActivity,
@@ -195,40 +196,189 @@ class GenericAgentHost:
                 tenant_id, agent_id = result
 
                 with BaggageBuilder().tenant_id(tenant_id).agent_id(agent_id).build():
-                    logger.info(f"📬 {notification_activity.notification_type}")
+                    logger.info("📧 EMAIL notification received")
 
-                    if not hasattr(
-                        self.agent_instance, "handle_agent_notification_activity"
-                    ):
-                        logger.warning("⚠️ Agent doesn't support notifications")
-                        await context.send_activity(
-                            "This agent doesn't support notification handling yet."
-                        )
+                    if not hasattr(self.agent_instance, "handle_email_notification"):
+                        logger.warning("⚠️ Agent doesn't support email notifications")
+                        await context.send_activity("This agent doesn't support email notifications yet.")
                         return
 
-                    response = (
-                        await self.agent_instance.handle_agent_notification_activity(
-                            notification_activity, self.agent_app.auth, self.auth_handler_name, context
-                        )
+                    response = await self.agent_instance.handle_email_notification(
+                        notification_activity, self.agent_app.auth, self.auth_handler_name, context
                     )
 
-                    # Skip sending response for lifecycle notifications (onboarding channel doesn't support replies)
-                    if notification_activity.notification_type == NotificationTypes.AGENT_LIFECYCLE:
-                        logger.info("📋 Lifecycle notification processed - no reply needed")
+                    # Email responses use special EmailResponse format
+                    response_activity = EmailResponse.create_email_response_activity(response)
+                    await context.send_activity(response_activity)
+
+            except Exception as e:
+                logger.error(f"❌ Email notification error: {e}")
+                await context.send_activity(f"Sorry, I encountered an error processing the email: {str(e)}")
+
+        # =====================================================================
+        # WORD NOTIFICATION HANDLER
+        # =====================================================================
+        @self.agent_notification.on_word(**handler_config)
+        async def on_word_notification(
+            context: TurnContext,
+            state: TurnState,
+            notification_activity: AgentNotificationActivity,
+        ):
+            try:
+                result = await self._validate_agent_and_setup_context(context)
+                if result is None:
+                    return
+                tenant_id, agent_id = result
+
+                with BaggageBuilder().tenant_id(tenant_id).agent_id(agent_id).build():
+                    logger.info("📄 WORD comment notification received")
+
+                    if not hasattr(self.agent_instance, "handle_word_notification"):
+                        logger.warning("⚠️ Agent doesn't support Word notifications")
+                        await context.send_activity("This agent doesn't support Word comment notifications yet.")
                         return
 
-                    if notification_activity.notification_type == NotificationTypes.EMAIL_NOTIFICATION:
-                        response_activity = EmailResponse.create_email_response_activity(response)
-                        await context.send_activity(response_activity)
-                        return
+                    response = await self.agent_instance.handle_word_notification(
+                        notification_activity, self.agent_app.auth, self.auth_handler_name, context
+                    )
 
                     await context.send_activity(response)
 
             except Exception as e:
-                logger.error(f"❌ Notification error: {e}")
-                await context.send_activity(
-                    f"Sorry, I encountered an error processing the notification: {str(e)}"
-                )
+                logger.error(f"❌ Word notification error: {e}")
+                await context.send_activity(f"Sorry, I encountered an error processing the Word comment: {str(e)}")
+
+        # =====================================================================
+        # EXCEL NOTIFICATION HANDLER
+        # =====================================================================
+        @self.agent_notification.on_excel(**handler_config)
+        async def on_excel_notification(
+            context: TurnContext,
+            state: TurnState,
+            notification_activity: AgentNotificationActivity,
+        ):
+            try:
+                result = await self._validate_agent_and_setup_context(context)
+                if result is None:
+                    return
+                tenant_id, agent_id = result
+
+                with BaggageBuilder().tenant_id(tenant_id).agent_id(agent_id).build():
+                    logger.info("📊 EXCEL comment notification received")
+
+                    if not hasattr(self.agent_instance, "handle_excel_notification"):
+                        logger.warning("⚠️ Agent doesn't support Excel notifications")
+                        await context.send_activity("This agent doesn't support Excel comment notifications yet.")
+                        return
+
+                    response = await self.agent_instance.handle_excel_notification(
+                        notification_activity, self.agent_app.auth, self.auth_handler_name, context
+                    )
+
+                    await context.send_activity(response)
+
+            except Exception as e:
+                logger.error(f"❌ Excel notification error: {e}")
+                await context.send_activity(f"Sorry, I encountered an error processing the Excel comment: {str(e)}")
+
+        # =====================================================================
+        # POWERPOINT NOTIFICATION HANDLER
+        # =====================================================================
+        @self.agent_notification.on_powerpoint(**handler_config)
+        async def on_powerpoint_notification(
+            context: TurnContext,
+            state: TurnState,
+            notification_activity: AgentNotificationActivity,
+        ):
+            try:
+                result = await self._validate_agent_and_setup_context(context)
+                if result is None:
+                    return
+                tenant_id, agent_id = result
+
+                with BaggageBuilder().tenant_id(tenant_id).agent_id(agent_id).build():
+                    logger.info("📽️ POWERPOINT comment notification received")
+
+                    if not hasattr(self.agent_instance, "handle_powerpoint_notification"):
+                        logger.warning("⚠️ Agent doesn't support PowerPoint notifications")
+                        await context.send_activity("This agent doesn't support PowerPoint comment notifications yet.")
+                        return
+
+                    response = await self.agent_instance.handle_powerpoint_notification(
+                        notification_activity, self.agent_app.auth, self.auth_handler_name, context
+                    )
+
+                    await context.send_activity(response)
+
+            except Exception as e:
+                logger.error(f"❌ PowerPoint notification error: {e}")
+                await context.send_activity(f"Sorry, I encountered an error processing the PowerPoint comment: {str(e)}")
+
+        # =====================================================================
+        # LIFECYCLE NOTIFICATION HANDLER
+        # =====================================================================
+        @self.agent_notification.on_agent_lifecycle_notification("*", **handler_config)
+        async def on_lifecycle_notification(
+            context: TurnContext,
+            state: TurnState,
+            notification_activity: AgentNotificationActivity,
+        ):
+            try:
+                result = await self._validate_agent_and_setup_context(context)
+                if result is None:
+                    return
+                tenant_id, agent_id = result
+
+                with BaggageBuilder().tenant_id(tenant_id).agent_id(agent_id).build():
+                    logger.info("📋 LIFECYCLE notification received")
+
+                    if not hasattr(self.agent_instance, "handle_lifecycle_notification"):
+                        logger.warning("⚠️ Agent doesn't support lifecycle notifications")
+                        return  # Lifecycle notifications don't need a response
+
+                    response = await self.agent_instance.handle_lifecycle_notification(
+                        notification_activity, self.agent_app.auth, self.auth_handler_name, context
+                    )
+
+                    # Lifecycle notifications don't send replies (onboarding channel doesn't support them)
+                    logger.info(f"📋 Lifecycle notification processed: {response}")
+
+            except Exception as e:
+                logger.error(f"❌ Lifecycle notification error: {e}")
+                # Don't send activity for lifecycle errors - channel may not support it
+
+        # =====================================================================
+        # FALLBACK: GENERIC NOTIFICATION HANDLER (for any unhandled types)
+        # =====================================================================
+        @self.agent_notification.on_agent_notification(
+            channel_id=ChannelId(channel="agents", sub_channel="*"),
+            **handler_config,
+        )
+        async def on_generic_notification(
+            context: TurnContext,
+            state: TurnState,
+            notification_activity: AgentNotificationActivity,
+        ):
+            try:
+                result = await self._validate_agent_and_setup_context(context)
+                if result is None:
+                    return
+                tenant_id, agent_id = result
+
+                with BaggageBuilder().tenant_id(tenant_id).agent_id(agent_id).build():
+                    notification_type = notification_activity.notification_type
+                    logger.info(f"📬 Generic notification received: {notification_type}")
+
+                    # This is a fallback for any notification types not explicitly handled above
+                    notification_text = getattr(notification_activity, 'text', None)
+                    if notification_text:
+                        await context.send_activity(f"Notification received: {notification_text[:100]}...")
+                    else:
+                        await context.send_activity(f"Notification of type {notification_type} acknowledged.")
+
+            except Exception as e:
+                logger.error(f"❌ Generic notification error: {e}")
+                await context.send_activity(f"Sorry, I encountered an error processing the notification: {str(e)}")
 
         # Message handler comes AFTER notification handler
         @self.agent_app.activity("message", **handler_config)
