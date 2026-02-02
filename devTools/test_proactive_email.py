@@ -2,31 +2,21 @@
 # Copyright (c) Microsoft. All rights reserved.
 
 """
-Test Proactive Teams Message via Blueprint Auth
+Test Proactive Email via Blueprint Auth
 
-This script tests proactive messaging scenarios:
+This script tests proactive email scenarios using Agent User Impersonation:
 1. Uses delegated token (BEARER_TOKEN from a365 develop get-token) if available
-2. Otherwise tries Blueprint Autonomous App Flow (app-only, no user context)
+2. Otherwise uses Agent User Impersonation flow (3-step: T1 -> T2 -> user_fic)
 
-For true Agent User Impersonation (agent acting as its agentic user identity),
-you need either:
-- Microsoft Entra SDK for Agent ID (sidecar container)
-- Microsoft.Identity.Web with .WithAgentIdentity()
-
-The Agent User Impersonation flow is a 3-step process that requires:
-1. T1: Blueprint -> Agent Identity
-2. T2: Agent Identity -> Agent User exchange 
-3. OBO: T1 + T2 + username -> Resource Token
-
-Reference: https://learn.microsoft.com/en-us/entra/agent-id/identity-platform/agent-user-oauth-flow
+The email will appear as sent FROM the agentic user identity.
 
 Usage:
-    # With delegated token (message appears from human user who ran get-token):
+    # With delegated token (email appears from human user who ran get-token):
     a365 develop get-token
-    uv run devTools/test_proactive_teams.py
+    uv run devTools/test_proactive_email.py
     
-    # Without token (autonomous app flow - may lack MCP scopes):
-    BEARER_TOKEN= uv run devTools/test_proactive_teams.py
+    # Without token (Agent User Impersonation - email from agentic user):
+    $env:BEARER_TOKEN=""; uv run devTools/test_proactive_email.py
 """
 
 import asyncio
@@ -36,7 +26,6 @@ import logging
 import os
 import sys
 from pathlib import Path
-from typing import Optional
 
 import aiohttp
 from dotenv import load_dotenv
@@ -60,7 +49,7 @@ logger = logging.getLogger(__name__)
 load_dotenv(Path(__file__).parent.parent / ".env")
 
 
-# ========== nb===================================================================
+# =============================================================================
 # MOCK AUTH CLASSES FOR PROACTIVE SCENARIOS
 # =============================================================================
 
@@ -94,7 +83,7 @@ class MockFrom:
 
 class MockConversation:
     def __init__(self):
-        self.id = "proactive-conversation"
+        self.id = "proactive-email-conversation"
 
 
 # =============================================================================
@@ -114,7 +103,7 @@ class Config:
     agent_user_upn = os.getenv("AGENT_USER_UPN", "")
     agent_user_object_id = os.getenv("AGENT_USER_OBJECT_ID", "")
     
-    # Target user
+    # Target user (same as Teams test)
     target_user_email = os.getenv("TARGET_USER_EMAIL", "")
     
     # MCP Platform
@@ -152,7 +141,7 @@ def decode_token(token: str, label: str) -> dict:
         payload = json.loads(base64.urlsafe_b64decode(payload_b64))
         
         logger.info(f"   {label} claims:")
-        for key in ["aud", "sub", "oid", "upn", "idtyp", "scp", "roles", "xms_act_fct"]:
+        for key in ["aud", "sub", "oid", "upn", "idtyp", "scp", "roles"]:
             if key in payload:
                 logger.info(f"      {key}: {payload.get(key)}")
         
@@ -164,15 +153,10 @@ def decode_token(token: str, label: str) -> dict:
 
 # =============================================================================
 # AGENT USER IMPERSONATION FLOW (3-step)
-# https://learn.microsoft.com/en-us/entra/agent-id/identity-platform/agent-user-oauth-flow
 # =============================================================================
 
 async def get_t1(session: aiohttp.ClientSession) -> str:
-    """
-    Step 1: Blueprint requests exchange token T1.
-    
-    Blueprint (with secret) + fmi_path -> T1
-    """
+    """Step 1: Blueprint requests exchange token T1."""
     logger.info("Step 1: Acquiring T1 (Blueprint -> Agent Identity exchange token)...")
     
     token_url = f"https://login.microsoftonline.com/{Config.tenant_id}/oauth2/v2.0/token"
@@ -201,11 +185,7 @@ async def get_t1(session: aiohttp.ClientSession) -> str:
 
 
 async def get_t2(session: aiohttp.ClientSession, t1: str) -> str:
-    """
-    Step 2: Agent Identity requests exchange token T2 for Agent User impersonation.
-    
-    Agent Identity + T1 -> T2
-    """
+    """Step 2: Agent Identity requests exchange token T2 for Agent User impersonation."""
     logger.info("Step 2: Acquiring T2 (Agent Identity -> Agent User exchange token)...")
     
     token_url = f"https://login.microsoftonline.com/{Config.tenant_id}/oauth2/v2.0/token"
@@ -233,22 +213,7 @@ async def get_t2(session: aiohttp.ClientSession, t1: str) -> str:
 
 
 async def get_mcp_token_as_agent_user(session: aiohttp.ClientSession, t1: str, t2: str) -> str:
-    """
-    Step 3: Agent Identity requests MCP token via user_fic grant for Agent User.
-    
-    Uses the correct user_fic grant type per Microsoft docs:
-    https://learn.microsoft.com/en-us/entra/agent-id/identity-platform/autonomous-agent-request-agent-user-tokens
-    
-    client_id=<agent-identity-id>
-    scope=<resource>/.default
-    grant_type=user_fic
-    client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer
-    client_assertion=<T1: agent-blueprint-token>
-    user_id=<agent-user-object-id>
-    user_federated_identity_credential=<T2: agent-identity-token>
-    
-    The resulting token represents the AGENT USER identity.
-    """
+    """Step 3: Agent Identity requests MCP token via user_fic grant for Agent User."""
     logger.info("Step 3: Acquiring MCP Token (user_fic grant type)...")
     
     token_url = f"https://login.microsoftonline.com/{Config.tenant_id}/oauth2/v2.0/token"
@@ -286,15 +251,15 @@ async def get_mcp_token_as_agent_user(session: aiohttp.ClientSession, t1: str, t
 # =============================================================================
 
 AGENT_INSTRUCTIONS = """You are a proactive assistant for Contoso. 
-You have access to Microsoft Teams via MCP tools.
-When asked to send a message to a specific user, you MUST:
+You have access to Microsoft Outlook via MCP mail tools.
 
-1. Use createChat with the EXACT email address provided. Pass members as an array with just that ONE email.
-2. If createChat succeeds, use the returned chatId with postMessage to send the message.
-3. Do NOT use listChats - always create a new chat with the specific user.
-4. Confirm when done with the chat ID and message details.
+When asked to send an email:
+1. Use the sendMail tool to send the email
+2. Include a proper subject line
+3. Format the body nicely (HTML is supported)
+4. Confirm when done with recipient and subject details
 
-IMPORTANT: The members parameter for createChat should be an array with the target user's email only, like ["user@domain.com"].
+Be professional and helpful in your email communications.
 """
 
 
@@ -306,7 +271,7 @@ async def main():
     """Main entry point."""
     print()
     print("=" * 70)
-    print("  Proactive Teams Message Test")
+    print("  Proactive Email Test")
     print("=" * 70)
     print()
     
@@ -323,7 +288,7 @@ async def main():
     logger.info(f"Blueprint:       {Config.blueprint_client_id}")
     logger.info(f"Agent Identity:  {Config.agent_identity_client_id}")
     logger.info(f"Agent User UPN:  {Config.agent_user_upn}")
-    logger.info(f"Target User:     {Config.target_user_email}")
+    logger.info(f"Target Email:    {Config.target_user_email}")
     print()
     
     # Check for BEARER_TOKEN first
@@ -331,11 +296,11 @@ async def main():
     
     if bearer_token:
         logger.info("Using BEARER_TOKEN from .env")
-        logger.info("(This is a delegated token - message will appear from the human who ran a365 develop get-token)")
+        logger.info("(This is a delegated token - email will appear from the human who ran a365 develop get-token)")
         mcp_token = bearer_token
     else:
         logger.info("No BEARER_TOKEN found - trying Agent User Impersonation flow...")
-        logger.warning("Note: This requires proper SDK support and may fail")
+        logger.info("(Email will appear FROM the agentic user identity)")
         
         async with aiohttp.ClientSession() as session:
             try:
@@ -354,10 +319,9 @@ async def main():
             except Exception as e:
                 logger.error(f"Agent User Impersonation failed: {e}")
                 logger.info("")
-                logger.info("To use proactive messaging, you have these options:")
-                logger.info("1. Run 'a365 develop get-token' for a delegated token (msg appears from human)")
-                logger.info("2. Use Microsoft Entra SDK for Agent ID (sidecar container)")
-                logger.info("3. Implement Microsoft.Identity.Web with .WithAgentIdentity()")
+                logger.info("To use proactive email, you have these options:")
+                logger.info("1. Run 'a365 develop get-token' for a delegated token (email appears from human)")
+                logger.info("2. Use Agent User Impersonation flow (email appears from agentic user)")
                 return 1
     
     logger.info(f"Token length: {len(mcp_token)} chars")
@@ -390,23 +354,40 @@ async def main():
             agent_instructions=AGENT_INSTRUCTIONS,
             bearer_token=mcp_token,
             auth=mock_auth,
-            auth_handler_name="PROACTIVE",
+            auth_handler_name="PROACTIVE-EMAIL",
             turn_context=mock_context,
         )
         
         logger.info("MCP servers initialized!")
         print()
         
-        # Send message
+        # Send email with a quote about hope
         target = Config.target_user_email
-        logger.info(f"Sending proactive message to {target}...")
+        logger.info(f"Sending proactive email to {target}...")
         
-        prompt = f"""Send a Teams message to {target}.
+        prompt = f"""Send an email to {target}.
 
-The message should be:
-"Hello! This is a proactive test message from Contoso Agent."
+Subject: A Message of Hope from Contoso Agent 🌟
 
-Create the chat and send the message, then confirm what you did."""
+Body:
+Hello!
+
+This is a proactive test email from Contoso Agent.
+
+Here's a quote about hope for you:
+
+"Hope is being able to see that there is light despite all of the darkness."
+— Desmond Tutu
+
+Wishing you a wonderful day ahead!
+
+Best regards,
+Contoso Agent
+
+---
+This email was sent automatically as part of a proactive messaging test.
+
+Send the email and confirm what you did."""
         
         logger.info(f"   Prompt: {prompt[:80]}...")
         
