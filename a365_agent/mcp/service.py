@@ -74,9 +74,9 @@ class MCPService:
         chat_client: Any,
         agent_instructions: str,
         bearer_token: str,
-        auth: Optional[Any] = None,
-        auth_handler_name: Optional[str] = None,
-        turn_context: Optional[Any] = None,
+        auth: Any,
+        auth_handler_name: Optional[str],
+        turn_context: Any,
         initial_tools: Optional[list] = None,
     ) -> Any:
         """
@@ -89,9 +89,9 @@ class MCPService:
             chat_client: The Azure OpenAI chat client
             agent_instructions: The agent's system prompt
             bearer_token: Pre-acquired bearer token for MCP
-            auth: Optional Authorization handler (for SDK compatibility)
-            auth_handler_name: Optional auth handler name (for SDK compatibility)
-            turn_context: Optional TurnContext (for SDK compatibility)
+            auth: Authorization handler (required by SDK)
+            auth_handler_name: Auth handler name (required by SDK)
+            turn_context: TurnContext (required by SDK)
             initial_tools: Optional list of initial tools
             
         Returns:
@@ -107,21 +107,16 @@ class MCPService:
         try:
             tool_service = self._get_tool_service()
             
-            # Build kwargs for SDK call
+            # Build kwargs for SDK call - all params are now required
             sdk_kwargs = {
                 "chat_client": chat_client,
                 "agent_instructions": agent_instructions,
                 "initial_tools": initial_tools or [],
                 "auth_token": bearer_token,
+                "auth": auth,
+                "auth_handler_name": auth_handler_name,
+                "turn_context": turn_context,
             }
-            
-            # Add optional auth params if provided (for SDK compatibility)
-            if auth is not None:
-                sdk_kwargs["auth"] = auth
-            if auth_handler_name is not None:
-                sdk_kwargs["auth_handler_name"] = auth_handler_name
-            if turn_context is not None:
-                sdk_kwargs["turn_context"] = turn_context
             
             agent = await tool_service.add_tool_servers_to_agent(**sdk_kwargs)
             

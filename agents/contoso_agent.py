@@ -25,17 +25,66 @@ from microsoft_agents.hosting.core import Authorization, TurnContext
 logger = logging.getLogger(__name__)
 
 
-def _load_system_prompt() -> str:
-    """Load the system prompt from the separate markdown file."""
+def _load_system_prompt(is_dev_mode: bool = False) -> str:
+    """
+    Load the system prompt from the separate markdown file.
+    
+    Args:
+        is_dev_mode: If True, includes DEV_ONLY sections and excludes PROD_ONLY sections.
+                     If False (default), includes PROD_ONLY sections and excludes DEV_ONLY sections.
+    
+    Returns:
+        The processed system prompt with appropriate sections included/excluded.
+    """
     prompt_path = Path(__file__).parent / "system_prompt.md"
     try:
-        return prompt_path.read_text(encoding="utf-8")
+        content = prompt_path.read_text(encoding="utf-8")
+        
+        # Process conditional sections based on mode
+        import re
+        
+        if is_dev_mode:
+            # Dev mode: Remove PROD_ONLY sections, keep DEV_ONLY content
+            content = re.sub(
+                r'\{\{PROD_ONLY_START\}\}.*?\{\{PROD_ONLY_END\}\}',
+                '',
+                content,
+                flags=re.DOTALL
+            )
+            # Remove DEV_ONLY markers but keep content
+            content = content.replace('{{DEV_ONLY_START}}', '')
+            content = content.replace('{{DEV_ONLY_END}}', '')
+            logger.info("📝 Loaded DEV mode system prompt (no chat history retrieval)")
+        else:
+            # Prod mode: Remove DEV_ONLY sections, keep PROD_ONLY content
+            content = re.sub(
+                r'\{\{DEV_ONLY_START\}\}.*?\{\{DEV_ONLY_END\}\}',
+                '',
+                content,
+                flags=re.DOTALL
+            )
+            # Remove PROD_ONLY markers but keep content
+            content = content.replace('{{PROD_ONLY_START}}', '')
+            content = content.replace('{{PROD_ONLY_END}}', '')
+            logger.info("📝 Loaded PROD mode system prompt (with chat history retrieval)")
+        
+        # Clean up extra blank lines
+        content = re.sub(r'\n{3,}', '\n\n', content)
+        
+        return content.strip()
     except FileNotFoundError:
         logger.error(f"System prompt file not found: {prompt_path}")
         raise
     except Exception as e:
         logger.error(f"Error loading system prompt: {e}")
         raise
+
+
+def _is_dev_mode() -> bool:
+    """Check if running in dev mode based on AGENT_MODE env var."""
+    import os
+    agent_mode = os.environ.get("AGENT_MODE", "prod").lower()
+    return agent_mode == "dev"
 
 
 class ContosoAgent(AgentBase):
@@ -50,7 +99,8 @@ class ContosoAgent(AgentBase):
     """
     
     # Agent system prompt - loaded from separate file for easier maintenance
-    AGENT_INSTRUCTIONS = _load_system_prompt()
+    # Mode is determined by AGENT_MODE env var (dev or prod)
+    AGENT_INSTRUCTIONS = _load_system_prompt(is_dev_mode=_is_dev_mode())
 
     # Processing timeout (seconds)
     PROCESSING_TIMEOUT = 120  # 2 minutes max for complex tasks with MCP
@@ -144,6 +194,9 @@ class ContosoAgent(AgentBase):
                 chat_client=self.chat_client,
                 agent_instructions=self.AGENT_INSTRUCTIONS,
                 bearer_token=self.auth_options.bearer_token,
+                auth=auth,
+                auth_handler_name=auth_handler_name,
+                turn_context=context,
             ) or self.agent
         else:
             self.agent = await self.mcp_service.initialize_with_agentic_auth(
@@ -184,7 +237,9 @@ class ContosoAgent(AgentBase):
         
         for attempt in range(max_retries):
             try:
+                logger.info(f"🤖 Calling agent.run() (attempt {attempt + 1}/{max_retries})...")
                 result = await self.agent.run(message)
+                logger.info("✅ Agent response received")
                 
                 # Success - clear any throttle on current model
                 if self.settings.model_pool and self.current_model:
@@ -252,12 +307,15 @@ class ContosoAgent(AgentBase):
             # Ensure MCP is initialized
             await self._ensure_mcp_initialized(auth, auth_handler_name, context)
             
+            # In dev mode, skip chat history retrieval (Playground doesn't have real chats)
+            is_dev_mode = _is_dev_mode()
+            
             # Extract chat ID from context for conversation history retrieval
             chat_id = None
-            if context.activity and context.activity.conversation:
+            if not is_dev_mode and context.activity and context.activity.conversation:
                 chat_id = getattr(context.activity.conversation, "id", None)
             
-            # Build the prompt with chat context for history retrieval
+            # Build the prompt with chat context for history retrieval (prod mode only)
             if chat_id:
                 augmented_message = f"""CHAT CONTEXT:
 - Chat ID: {chat_id}

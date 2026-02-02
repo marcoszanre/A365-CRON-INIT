@@ -32,6 +32,7 @@ env/
 .env.dev
 .env.local
 .env_local
+.env.prod
 .env.production
 .env.development
 
