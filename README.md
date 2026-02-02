@@ -14,88 +14,278 @@ A production-ready Python agent built with the **Microsoft Agent 365 SDK** and *
 
 - **Python 3.11+**
 - **[uv](https://docs.astral.sh/uv/)** - Fast Python package manager
-- **[Agent 365 CLI](https://learn.microsoft.com/en-us/microsoft-agent-365/developer/cli)** - For blueprint setup
-- **[ngrok](https://ngrok.com/)** - For local development tunneling
+- **[Agent 365 CLI](https://learn.microsoft.com/en-us/microsoft-agent-365/developer/agent-365-cli)** - For blueprint setup and configuration
+- **[Azure CLI](https://learn.microsoft.com/en-us/cli/azure/install-azure-cli)** - For Azure authentication (`az login`)
+- **[ngrok](https://ngrok.com/)** - **Required** for local development (exposes your agent to receive Teams/Email notifications)
+- **[Agents Playground](https://learn.microsoft.com/en-us/microsoft-365/agents-sdk/test-with-toolkit-project)** - Optional local testing UI (`winget install agentsplayground`)
 - **Azure OpenAI** - Deployed GPT model (e.g., `gpt-4o`, `gpt-4.1-mini`)
-- **Microsoft 365 Tenant** - With Agent 365 preview access
+- **Microsoft 365 Tenant** - With [Agent 365 Frontier preview](https://adoption.microsoft.com/copilot/frontier-program/) access
 
 ## Quick Start
+
+This sample supports two workflows based on the [Agent 365 Development Lifecycle](https://learn.microsoft.com/en-us/microsoft-agent-365/developer/a365-dev-lifecycle):
+
+| Mode | Use Case | Authentication | Endpoint |
+|------|----------|----------------|----------|
+| **Dev** | Quick local testing with Agents Playground | Bearer token (`a365 develop get-token`) | localhost |
+| **Prod** | Full Teams/Email integration with real agent instance | Agentic auth (blueprint credentials) | ngrok static domain |
+
+---
+
+## 🛠️ Development Mode (Quick Testing)
+
+Use this for rapid iteration with Agents Playground. No blueprint setup required.
 
 ### 1. Clone and Install
 
 ```bash
 git clone <repo-url>
 cd agent365-agentframework-python
-
-# Install dependencies with uv
 uv sync
 ```
 
-### 2. Initialize Agent 365 Blueprint
+### 2. Initialize Config (Dev Mode)
 
 ```bash
-# Login and create blueprint
-a365 login
-a365 init
-
-# Setup permissions and authentication
-a365 setup
+az login
+a365 config init
 ```
 
-### 3. Configure Environment
+When prompted, set `needDeployment: false` (you're running locally, not deploying to Azure).
 
-Copy the template and the CLI will populate most values:
+### 3. Configure Environment
 
 ```bash
 cp .env.template .env
 ```
 
-Then fill in your **Azure OpenAI** configuration:
+**Configure Azure OpenAI** in `.env`:
 
 ```env
-# Model 1 (PRIMARY)
 AZURE_OPENAI_MODEL_1_ENDPOINT=https://your-resource.openai.azure.com
 AZURE_OPENAI_MODEL_1_DEPLOYMENT=gpt-4.1-mini
 AZURE_OPENAI_MODEL_1_API_KEY=your-api-key
+```
 
-# Model 2 (FALLBACK - optional)
-AZURE_OPENAI_MODEL_2_ENDPOINT=https://your-resource.openai.azure.com
-AZURE_OPENAI_MODEL_2_DEPLOYMENT=gpt-4o-mini
-AZURE_OPENAI_MODEL_2_API_KEY=your-api-key
+**Set Dev Mode** (uses bearer token auth):
+
+```env
+AGENT_MODE=dev
+USE_AGENTIC_AUTH=false
 ```
 
 ### 4. Add MCP Servers
 
 ```bash
-# Add the MCP servers you need
+a365 develop add-permissions
 a365 develop add-mcp-servers mcp_TeamsServer
 a365 develop add-mcp-servers mcp_MailTools
 a365 develop add-mcp-servers mcp_MeServer
 ```
 
-### 5. Get Development Token
+### 5. Get Bearer Token
 
 ```bash
-# Get a token for local MCP testing
+# Get tokens for local MCP testing (expires ~1 hour)
 a365 develop get-token
 ```
 
-### 6. Run the Agent
+This updates `BEARER_TOKEN` in your `.env` file.
+
+### 6. Customize System Prompt
+
+Edit `agents/system_prompt.md` to define your agent's personality and tool instructions.
+
+### 7. Run and Test
 
 ```bash
-# Start ngrok tunnel
-ngrok http 3978
+# Terminal 1: Start the agent
+uv run main.py
 
-# In another terminal, start the agent
+# Terminal 2: Start Agents Playground
+agentsplayground
+```
+
+Send test messages in Agents Playground to verify your agent works.
+
+> **Note:** In dev mode with bearer token, you're testing as **your user identity**, not the agent's identity. Tool calls use your permissions.
+
+---
+
+## 🚀 Production Mode (Full Deployment)
+
+Use this for real Teams/Email integration with an agentic user identity.
+
+### 1. Clone and Install
+
+```bash
+git clone <repo-url>
+cd agent365-agentframework-python
+uv sync
+```
+
+### 2. Setup ngrok Static Domain
+
+Get a [free static domain from ngrok](https://dashboard.ngrok.com/domains) (e.g., `your-agent.ngrok-free.app`). This gives you a consistent URL that won't change.
+
+```bash
+# Start ngrok with your static domain
+ngrok http 3978 --domain=your-agent.ngrok-free.app
+```
+
+### 3. Initialize Config (Prod Mode)
+
+```bash
+az login
+a365 config init
+```
+
+During the wizard:
+- Set `needDeployment: false` (running locally with ngrok)
+- Set `messagingEndpoint: https://your-agent.ngrok-free.app/api/messages`
+
+Your `a365.config.json` should look like:
+
+```json
+{
+  "needDeployment": false,
+  "messagingEndpoint": "https://your-agent.ngrok-free.app/api/messages",
+  ...
+}
+```
+
+### 4. Setup Agent Blueprint and Permissions
+
+The setup process has multiple steps. You can run them individually for more control:
+
+```bash
+# Option A: Run all setup steps at once
+a365 setup all --skip-infrastructure
+
+# Option B: Run steps individually for more control
+a365 setup blueprint                 # Create blueprint (Entra ID app registration)
+a365 setup permissions mcp           # Configure MCP server OAuth2 grants
+a365 setup permissions bot           # Configure Messaging Bot API permissions
+```
+
+This creates `a365.generated.config.json` with your agent's credentials.
+
+### 5. Add MCP Servers
+
+```bash
+# Add MCP servers to your ToolingManifest.json
+a365 develop add-mcp-servers mcp_TeamsServer
+a365 develop add-mcp-servers mcp_MailTools
+a365 develop add-mcp-servers mcp_MeServer
+```
+
+### 6. Grant MCP Permissions to Blueprint
+
+After adding MCP servers, grant the permissions to your blueprint:
+
+```bash
+# Add delegated permissions for the MCP servers you added
+a365 develop add-permissions
+```
+
+> **Note:** This grants the OAuth scopes from your `ToolingManifest.json` to your blueprint.
+
+### 7. Configure Environment
+
+```bash
+cp .env.template .env
+```
+
+**Get blueprint credentials:**
+
+```bash
+a365 config display -g
+```
+
+**Copy to `.env`:**
+
+| From `a365 config display -g` | `.env` Variable |
+|-------------------------------|-----------------|
+| `agentBlueprintId` | `CONNECTIONS__SERVICE_CONNECTION__SETTINGS__CLIENTID` |
+| `agentBlueprintClientSecret` | `CONNECTIONS__SERVICE_CONNECTION__SETTINGS__CLIENTSECRET` |
+| `tenantId` | `CONNECTIONS__SERVICE_CONNECTION__SETTINGS__TENANTID` |
+
+**Configure Azure OpenAI** in `.env`:
+
+```env
+AZURE_OPENAI_MODEL_1_ENDPOINT=https://your-resource.openai.azure.com
+AZURE_OPENAI_MODEL_1_DEPLOYMENT=gpt-4.1-mini
+AZURE_OPENAI_MODEL_1_API_KEY=your-api-key
+```
+
+**Set Prod Mode** (uses agentic auth):
+
+```env
+AGENT_MODE=prod
+USE_AGENTIC_AUTH=true
+```
+
+### 8. Customize System Prompt
+
+Edit `agents/system_prompt.md` to define your agent's personality and tool instructions.
+
+### 9. Publish to Microsoft 365 Admin Center
+
+```bash
+a365 publish
+```
+
+This makes your agent available for admins to approve and users to create instances.
+
+### 10. Configure in Teams Developer Portal
+
+1. Get your blueprint ID:
+   ```bash
+   a365 config display -g
+   # Copy agentBlueprintId
+   ```
+
+2. Open: `https://dev.teams.microsoft.com/tools/agent-blueprint/<agentBlueprintId>/configuration`
+
+3. Configure:
+   - **Agent Type**: Bot Based
+   - **Bot ID**: `<agentBlueprintId>`
+   - Click **Save**
+
+### 11. Approve in Microsoft 365 Admin Center
+
+1. Go to [Microsoft 365 Admin Center - Agents](https://admin.cloud.microsoft/#/agents/all)
+2. Find your agent in the list
+3. Approve for your tenant
+
+### 12. Create Agent Instance in Teams
+
+1. Open **Teams** → **Apps**
+2. Search for your agent name
+3. Click **Request Instance** or **Add**
+4. Wait for admin approval (if required)
+5. Once approved, give your agent instance a name
+
+### 13. Run the Agent
+
+```bash
+# Make sure ngrok is running with your static domain
+ngrok http 3978 --domain=your-agent.ngrok-free.app
+
+# Start the agent
 uv run main.py
 ```
 
-### 7. Update Endpoint
+### 14. Test in Teams
 
-```bash
-# Update the agent endpoint to your ngrok URL
-a365 develop update-endpoint --url https://your-ngrok-url.ngrok-free.app/api/messages
-```
+1. Search for your agent user in Teams
+2. Start a chat
+3. Send a test message: `Hello!`
+4. Test tool calls: `Send an email to yourself@company.com with subject "Test" and body "Hello from my agent!"`
+
+See [Create agent instances](https://learn.microsoft.com/en-us/microsoft-agent-365/developer/create-instance) and [Testing agents](https://learn.microsoft.com/en-us/microsoft-agent-365/developer/testing?tabs=python) for full documentation.
+
+---
 
 ## Project Structure
 
@@ -188,12 +378,14 @@ a365 develop add-mcp-servers <server-name>
 
 ## System Prompt
 
-The agent's personality and instructions are defined in `agents/system_prompt.md`. Edit this file to customize:
+**Important:** The agent's personality and instructions are defined in `agents/system_prompt.md`. **You must customize this file** before running your agent to define:
 
+- Agent name and personality
 - Available MCP tools and how to use them
 - Conversation context handling (Teams chat history)
 - Email reply behavior (Reply vs Reply All)
 - User lookup instructions
+- Any domain-specific instructions
 
 ## Multi-Model Failover
 
@@ -213,12 +405,20 @@ On 429 (rate limit) errors, the agent automatically switches to the next availab
 
 ## Publishing
 
-To publish the agent to your tenant:
+To publish the agent to Microsoft 365 admin center. See [Publish agent](https://learn.microsoft.com/en-us/microsoft-agent-365/developer/publish).
 
 ```bash
-# Build and publish
+# Verify setup is complete
+a365 config display -g  # Should show agentBlueprintId
+
+# Deploy to Azure (if not already deployed)
+a365 deploy
+
+# Publish to Microsoft 365 admin center
 a365 publish
 ```
+
+After publishing, configure the agent blueprint in [Teams Developer Portal](https://learn.microsoft.com/en-us/microsoft-agent-365/developer/create-instance#1-configure-agent-in-teams-developer-portal), then create agent instances from [Microsoft 365 admin center](https://learn.microsoft.com/en-us/microsoft-agent-365/developer/create-instance).
 
 ## Logging
 
