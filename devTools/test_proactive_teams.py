@@ -48,10 +48,11 @@ from a365_agent.config import get_settings
 from a365_agent.mcp import MCPService
 from agent_framework.azure import AzureOpenAIChatClient
 
-# Configure logging
+# Configure logging to stdout (not stderr, which shows as red in PowerShell)
 logging.basicConfig(
     level=logging.INFO,
-    format="%(levelname)s: %(message)s"
+    format="%(levelname)s: %(message)s",
+    stream=sys.stdout
 )
 logger = logging.getLogger(__name__)
 
@@ -367,6 +368,9 @@ async def main():
         logger.info("Initializing MCP servers...")
         
         settings = get_settings()
+        if settings.model_pool is None:
+            logger.error("model_pool is not configured in settings")
+            return 1
         model = settings.model_pool.get_next_model()
         
         chat_client = AzureOpenAIChatClient(
@@ -432,5 +436,7 @@ Create the chat and send the message, then confirm what you did."""
 
 
 if __name__ == "__main__":
+    import warnings
+    warnings.filterwarnings("ignore", category=RuntimeWarning, message=".*cancel scope.*")
     exit_code = asyncio.run(main())
     sys.exit(exit_code)
