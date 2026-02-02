@@ -74,17 +74,24 @@ class MCPService:
         chat_client: Any,
         agent_instructions: str,
         bearer_token: str,
+        auth: Optional[Any] = None,
+        auth_handler_name: Optional[str] = None,
+        turn_context: Optional[Any] = None,
         initial_tools: Optional[list] = None,
     ) -> Any:
         """
-        Initialize MCP servers using a bearer token (dev mode).
+        Initialize MCP servers using a bearer token (dev mode or proactive mode).
         
         This is the fast path for development when you have a pre-acquired token.
+        For proactive scenarios, you can pass the Blueprint-acquired token directly.
         
         Args:
             chat_client: The Azure OpenAI chat client
             agent_instructions: The agent's system prompt
             bearer_token: Pre-acquired bearer token for MCP
+            auth: Optional Authorization handler (for SDK compatibility)
+            auth_handler_name: Optional auth handler name (for SDK compatibility)
+            turn_context: Optional TurnContext (for SDK compatibility)
             initial_tools: Optional list of initial tools
             
         Returns:
@@ -100,12 +107,23 @@ class MCPService:
         try:
             tool_service = self._get_tool_service()
             
-            agent = await tool_service.add_tool_servers_to_agent(
-                chat_client=chat_client,
-                agent_instructions=agent_instructions,
-                initial_tools=initial_tools or [],
-                auth_token=bearer_token,
-            )
+            # Build kwargs for SDK call
+            sdk_kwargs = {
+                "chat_client": chat_client,
+                "agent_instructions": agent_instructions,
+                "initial_tools": initial_tools or [],
+                "auth_token": bearer_token,
+            }
+            
+            # Add optional auth params if provided (for SDK compatibility)
+            if auth is not None:
+                sdk_kwargs["auth"] = auth
+            if auth_handler_name is not None:
+                sdk_kwargs["auth_handler_name"] = auth_handler_name
+            if turn_context is not None:
+                sdk_kwargs["turn_context"] = turn_context
+            
+            agent = await tool_service.add_tool_servers_to_agent(**sdk_kwargs)
             
             init_duration = asyncio.get_event_loop().time() - init_start
             self._initialized = True
