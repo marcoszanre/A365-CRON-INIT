@@ -237,7 +237,13 @@ a365 publish
 
 This makes your agent available for admins to approve and users to create instances.
 
-### 10. Configure in Teams Developer Portal
+### 10. Approve in Microsoft 365 Admin Center
+
+1. Go to [Microsoft 365 Admin Center - Agents](https://admin.cloud.microsoft/#/agents/all)
+2. Find your agent in the list
+3. Approve for your tenant
+
+### 11. Configure in Teams Developer Portal
 
 1. Get your blueprint ID:
    ```bash
@@ -251,12 +257,6 @@ This makes your agent available for admins to approve and users to create instan
    - **Agent Type**: Bot Based
    - **Bot ID**: `<agentBlueprintId>`
    - Click **Save**
-
-### 11. Approve in Microsoft 365 Admin Center
-
-1. Go to [Microsoft 365 Admin Center - Agents](https://admin.cloud.microsoft/#/agents/all)
-2. Find your agent in the list
-3. Approve for your tenant
 
 ### 12. Create Agent Instance in Teams
 
