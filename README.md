@@ -56,23 +56,18 @@ When prompted, set `needDeployment: false` (you're running locally, not deployin
 ### 3. Configure Environment
 
 ```bash
-cp .env.template .env
+cp .env.dev.template .env
 ```
 
 **Configure Azure OpenAI** in `.env`:
 
 ```env
-AZURE_OPENAI_MODEL_1_ENDPOINT=https://your-resource.openai.azure.com
-AZURE_OPENAI_MODEL_1_DEPLOYMENT=gpt-4.1-mini
-AZURE_OPENAI_MODEL_1_API_KEY=your-api-key
+AZURE_OPENAI_ENDPOINT=https://your-resource.openai.azure.com
+AZURE_OPENAI_DEPLOYMENT=gpt-4.1-mini
+AZURE_OPENAI_API_KEY=your-api-key
 ```
 
-**Set Dev Mode** (uses bearer token auth):
-
-```env
-AGENT_MODE=dev
-USE_AGENTIC_AUTH=false
-```
+> **Note:** Dev mode uses single-model config. The template already has `AGENT_MODE=dev` and `USE_AGENTIC_AUTH=false` set.
 
 ### 4. Add MCP Servers
 
@@ -192,6 +187,8 @@ a365 develop add-permissions
 
 ### 7. Configure Environment
 
+Prod mode uses the multi-model template:
+
 ```bash
 cp .env.template .env
 ```
@@ -210,20 +207,21 @@ a365 config display -g
 | `agentBlueprintClientSecret` | `CONNECTIONS__SERVICE_CONNECTION__SETTINGS__CLIENTSECRET` |
 | `tenantId` | `CONNECTIONS__SERVICE_CONNECTION__SETTINGS__TENANTID` |
 
-**Configure Azure OpenAI** in `.env`:
+**Configure Azure OpenAI** (multi-model with failover support):
 
 ```env
+# Model 1 (PRIMARY)
 AZURE_OPENAI_MODEL_1_ENDPOINT=https://your-resource.openai.azure.com
 AZURE_OPENAI_MODEL_1_DEPLOYMENT=gpt-4.1-mini
 AZURE_OPENAI_MODEL_1_API_KEY=your-api-key
+
+# Model 2 (FALLBACK - optional)
+AZURE_OPENAI_MODEL_2_ENDPOINT=https://your-resource.openai.azure.com
+AZURE_OPENAI_MODEL_2_DEPLOYMENT=gpt-4o-mini
+AZURE_OPENAI_MODEL_2_API_KEY=your-api-key
 ```
 
-**Set Prod Mode** (uses agentic auth):
-
-```env
-AGENT_MODE=prod
-USE_AGENTIC_AUTH=true
-```
+> **Note:** The template already has `AGENT_MODE=prod` and `USE_AGENTIC_AUTH=true` set.
 
 ### 8. Customize System Prompt
 
