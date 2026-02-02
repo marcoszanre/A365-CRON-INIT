@@ -29,6 +29,7 @@ env/
 
 # Environment files (contain secrets)
 .env
+.env.dev
 .env.local
 .env_local
 .env.production
@@ -76,4 +77,8 @@ manifest/manifest.zip
 
 # Token cache
 token_cache.bin
-.env.dev
+
+# Azurite storage emulator files
+__azurite_db_queue__.json
+__azurite_db_queue_extent__.json
+__queuestorage__/
