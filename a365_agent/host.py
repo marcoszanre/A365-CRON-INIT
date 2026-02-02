@@ -306,9 +306,13 @@ class GenericAgentHost(NotificationHandlerMixin):
                         logger.warning(f"⚠️ Email timeout after {self.EMAIL_NOTIFICATION_TIMEOUT}s")
                         response = "Thank you for your email. I'm still processing and will follow up."
                     
-                    # Only send a response if there is one (empty = system notification, ignore)
+                    # When the agent uses MCP to send emails, we don't need to reply through
+                    # the notification channel. The MCP response IS the email. Just log and return.
+                    # Only try notification channel reply if MCP wasn't used (legacy fallback).
                     if response and response.strip():
-                        await safe_send_email_response(context, response)
+                        logger.info(f"📧 Email handled: {response[:80]}...")
+                        # Skip notification channel reply - agent already sent via MCP
+                        # The notification channel has a ~30s timeout and often 404s anyway
                     else:
                         logger.info("📧 No response needed (system notification ignored)")
                     

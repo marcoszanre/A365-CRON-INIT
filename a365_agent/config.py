@@ -326,6 +326,10 @@ class Settings:
             format="%(levelname)s:%(name)s:%(message)s"
         )
         
+        # Control agent_framework log level (MCP tool calls) via env
+        af_log_level = os.getenv("AGENT_FRAMEWORK_LOG_LEVEL", "INFO").upper()
+        logging.getLogger("agent_framework").setLevel(getattr(logging, af_log_level, logging.INFO))
+        
         # Suppress verbose Azure SDK logging
         logging.getLogger("azure.core.pipeline.policies.http_logging_policy").setLevel(logging.WARNING)
         logging.getLogger("azure.identity").setLevel(logging.ERROR)
