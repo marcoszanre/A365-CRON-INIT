@@ -209,6 +209,13 @@ class ContosoAgent(AgentBase):
         
         self.mcp_servers_initialized = True
         logger.info("✅ MCP servers ready")
+
+    async def _reset_mcp_after_error(self) -> None:
+        """Best-effort cleanup for MCP resources after a failure."""
+        try:
+            await self.mcp_service.cleanup()
+        finally:
+            self.mcp_servers_initialized = False
     
     def _extract_result(self, result) -> str:
         """Extract text content from agent result."""
@@ -221,7 +228,7 @@ class ContosoAgent(AgentBase):
         elif hasattr(result, "content"):
             return str(result.content)
         return str(result)
-    
+
     async def _run_with_failover(self, message: str, max_retries: int = 3) -> str:
         """
         Run agent with automatic failover to other models on rate limiting (429).
@@ -328,13 +335,16 @@ USER MESSAGE:
             
             # Process with timeout and automatic failover on rate limits
             async with asyncio.timeout(self.PROCESSING_TIMEOUT):
-                return await self._run_with_failover(augmented_message)
+                response = await self._run_with_failover(augmented_message)
+            return response
             
         except asyncio.TimeoutError:
             logger.error(f"Processing timeout after {self.PROCESSING_TIMEOUT}s")
+            await self._reset_mcp_after_error()
             return "Sorry, the request took too long. Please try again."
         except Exception as e:
             logger.error(f"Error processing message: {e}")
+            await self._reset_mcp_after_error()
             return f"Sorry, I encountered an error: {str(e)}"
     
     # =========================================================================
@@ -355,10 +365,10 @@ USER MESSAGE:
         if context.activity.conversation:
             subject = getattr(context.activity.conversation, "topic", "") or ""
         subject_lower = subject.lower()
-        
+
         text_content = getattr(context.activity, "text", "") or ""
         text_lower = text_content.lower()
-        
+
         # Get HTML body for pattern matching
         html_body = ""
         entities = getattr(context.activity, "entities", []) or []
@@ -371,7 +381,7 @@ USER MESSAGE:
                     html_body = entity.get("htmlBody", "") or ""
                 break
         html_lower = html_body.lower()
-        
+
         # Patterns that indicate system-generated notifications
         system_patterns = [
             # Sharing notifications
@@ -382,40 +392,40 @@ USER MESSAGE:
             "has shared",
             "gave you access",
             "deu acesso",
-            
+
             # Comment mention notifications (duplicates - handled by Word/Excel/PPT handlers)
             "mentioned you in",
             "mencionou você",
             "go to comment",
             "ir para comentário",
-            
+
             # Site/Team notifications
             "follow this site",
             "siga este site",
             "you've been added to",
             "você foi adicionado",
             "welcome to the team",
-            
+
             # Document notifications
             "document is ready",
             "shared a file",
             "shared a folder",
             "compartilhou um arquivo",
             "compartilhou uma pasta",
-            
+
             # Calendar system notifications (not actual invites from people)
             "your meeting was updated",
             "meeting canceled",
             "reunião foi atualizada",
             "reunião cancelada",
         ]
-        
+
         # Check all text fields for system patterns
         all_text = f"{subject_lower} {text_lower} {html_lower}"
         for pattern in system_patterns:
             if pattern in all_text:
                 return True
-        
+
         # Check for SharePoint/OneDrive system URLs in HTML (indicates automated notification)
         if html_body:
             sharepoint_patterns = [
@@ -430,9 +440,9 @@ USER MESSAGE:
                     # Check if it seems like a sharing/access notification
                     if any(x in all_text for x in ["shared", "compartilh", "access", "acesso", "convid", "invited"]):
                         return True
-        
+
         return False
-    
+
     async def handle_email_notification(
         self,
         notification_activity,

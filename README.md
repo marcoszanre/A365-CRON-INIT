@@ -40,7 +40,7 @@ Use this for rapid iteration with Agents Playground. No blueprint setup required
 
 ```bash
 git clone <repo-url>
-cd agent365-agentframework-python
+cd python-a365-sample
 uv sync
 ```
 
@@ -57,6 +57,8 @@ When prompted, set `needDeployment: false` (you're running locally, not deployin
 
 ```bash
 cp .env.dev.template .env
+# PowerShell:
+# copy .env.dev.template .env
 ```
 
 **Configure Azure OpenAI** in `.env`:
@@ -95,7 +97,9 @@ Edit `agents/system_prompt.md` to define your agent's personality and tool instr
 
 ```bash
 # Terminal 1: Start the agent
-uv run main.py
+uv run python main.py
+# PowerShell:
+# uv run python .\main.py
 
 # Terminal 2: Start Agents Playground
 agentsplayground
