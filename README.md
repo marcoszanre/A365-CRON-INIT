@@ -202,45 +202,6 @@ This creates `a365.generated.config.json` with your agent's credentials.
 > a365 setup permissions bot           # Configure Messaging Bot API permissions
 > ```
 
-> ⚠️ **Troubleshooting: `insufficient_scope` error with `AgentTools.AgentBluePrint.Create`**
->
-> If you see this error during `a365 setup blueprint --endpoint-only`:
-> ```
-> ERROR: Error response: {"error":"insufficient_scope","error_description":"Access denied: Scope 'AgentTools.AgentBluePrint.Create' is not present in the request.","required_scope":"AgentTools.AgentBluePrint.Create"}
-> ```
->
-> **Root cause:** Your custom client app is missing the `AgentTools.AgentBluePrint.Create` delegated permission, or the CLI is using a cached token without the scope.
->
-> **Solution:**
->
-> 1. **Grant the missing permission** to your custom client app (`clientAppId` in `a365.config.json`):
->    ```powershell
->    # Get the Agent Tools service principal ID
->    az ad sp show --id ea9ffc3e-8a23-4a7d-836d-234d7c7565c1 --query "id" -o tsv
->    # Example output: 94d7c8a2-c083-4476-acc6-bf8854ceec02
->
->    # Get your custom client app's service principal ID  
->    az ad sp show --id <YOUR_CLIENT_APP_ID> --query "id" -o tsv
->    # Example output: b8f70387-9d43-437d-aeae-e5c3811d41a4
->
->    # Check existing grants for Agent Tools
->    az rest --method GET --uri 'https://graph.microsoft.com/v1.0/oauth2PermissionGrants?$filter=clientId%20eq%20%27<SP_OBJECT_ID>%27%20and%20resourceId%20eq%20%27<AGENT_TOOLS_SP_ID>%27'
->
->    # PATCH the grant to add the scope (use the grant ID from above)
->    $body = '{"scope":"<EXISTING_SCOPES> AgentTools.AgentBluePrint.Create"}' | Out-File "$env:TEMP\patch.json" -Encoding utf8
->    az rest --method PATCH --uri "https://graph.microsoft.com/v1.0/oauth2PermissionGrants/<GRANT_ID>" --headers "Content-Type=application/json" --body "@$env:TEMP\patch.json"
->    ```
->
-> 2. **Clear the A365 CLI token cache** (the CLI caches tokens and won't pick up new scopes):
->    ```powershell
->    Remove-Item "$env:LOCALAPPDATA\Microsoft.Agents.A365.DevTools.Cli\auth-token*" -Force
->    ```
->
-> 3. **Retry the setup:**
->    ```powershell
->    a365 setup blueprint --endpoint-only
->    ```
-
 ### 5. Add MCP Servers
 
 ```bash
