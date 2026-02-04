@@ -1,5 +1,17 @@
 # Agent 365 Python Framework Sample
 
+<div align="center">
+
+### 🎬 Watch the Demo
+
+[![Agent 365 Demo](https://img.shields.io/badge/▶_Watch_Demo-YouTube-FF0000?style=for-the-badge&logo=youtube&logoColor=white)](https://youtu.be/HBr3PicYtNw)
+
+*See the Agent 365 Python Framework in action!*
+
+---
+
+</div>
+
 A production-ready Python agent built with the **Microsoft Agent 365 SDK** and **AgentFramework SDK**. This agent demonstrates enterprise-grade AI capabilities:
 
 - 🔐 **Agentic Identity** - Entra-backed identity with its own mailbox and Teams presence
@@ -88,6 +100,20 @@ a365 develop get-token
 ```
 
 This updates `BEARER_TOKEN` in your `.env` file.
+
+> ⚠️ **Troubleshooting MCP Issues:** If you encounter MCP-related errors during development, try clearing your local token cache:
+> 
+> **Windows:**
+> ```powershell
+> Remove-Item -Path "$env:LOCALAPPDATA\Microsoft\TokenBroker\a365" -Recurse -Force
+> ```
+> 
+> **macOS/Linux:**
+> ```bash
+> rm -rf ~/.local/share/Microsoft/TokenBroker/a365
+> ```
+> 
+> Then run `a365 develop get-token` again to refresh your tokens.
 
 ### 6. Customize System Prompt
 
