@@ -1,18 +1,9 @@
 # Agent 365 Python Framework Sample
 
-<div align="center">
-
-### 🎬 Watch the Demo
-
-[![Agent 365 Demo](https://img.shields.io/badge/▶_Watch_Demo-YouTube-FF0000?style=for-the-badge&logo=youtube&logoColor=white)](https://youtu.be/HBr3PicYtNw)
-
-*See the Agent 365 Python Framework in action!*
-
-[![Official Docs](https://img.shields.io/badge/📚_Official_Docs-Microsoft_Learn-0078D4?style=for-the-badge&logo=microsoft&logoColor=white)](https://learn.microsoft.com/en-us/microsoft-agent-365/)
-
----
-
-</div>
+<p>
+  <a href="https://youtu.be/HBr3PicYtNw" target="_blank"><img src="https://img.shields.io/badge/▶_Watch_Demo-YouTube-FF0000?style=flat-square&logo=youtube&logoColor=white" alt="Watch Demo"></a>
+  <a href="https://learn.microsoft.com/en-us/microsoft-agent-365/" target="_blank"><img src="https://img.shields.io/badge/📚_Docs-Microsoft_Learn-0078D4?style=flat-square&logo=microsoft&logoColor=white" alt="Official Docs"></a>
+</p>
 
 A production-ready Python agent built with the **Microsoft Agent 365 SDK** and **AgentFramework SDK**. This agent demonstrates enterprise-grade AI capabilities:
 
