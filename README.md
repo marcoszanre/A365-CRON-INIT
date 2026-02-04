@@ -8,6 +8,8 @@
 
 *See the Agent 365 Python Framework in action!*
 
+[![Official Docs](https://img.shields.io/badge/📚_Official_Docs-Microsoft_Learn-0078D4?style=for-the-badge&logo=microsoft&logoColor=white)](https://learn.microsoft.com/en-us/microsoft-agent-365/)
+
 ---
 
 </div>
@@ -256,6 +258,9 @@ AZURE_OPENAI_MODEL_1_API_KEY=your-api-key
 AZURE_OPENAI_MODEL_2_ENDPOINT=https://your-resource.openai.azure.com
 AZURE_OPENAI_MODEL_2_DEPLOYMENT=gpt-4o-mini
 AZURE_OPENAI_MODEL_2_API_KEY=your-api-key
+
+# Common API version for all models
+AZURE_OPENAI_API_VERSION=2024-05-01-preview
 ```
 
 > **Note:** The template already has `AGENT_MODE=prod` and `USE_AGENTIC_AUTH=true` set.
