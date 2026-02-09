@@ -8,7 +8,10 @@ Uses Azure OpenAI and MCP servers for extended functionality.
 """
 
 import asyncio
+import aiohttp
+import json
 import logging
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -129,6 +132,17 @@ class ContosoAgent(AgentBase):
         
         # Track MCP initialization state
         self.mcp_servers_initialized = False
+        
+        # =====================================================================
+        # INITIALIZATION GATE STATE
+        # =====================================================================
+        # Tracks whether the agent has been initialized against the SharePoint
+        # list. This is checked deterministically in code, not left to the LLM.
+        self._init_gate_checked = False
+        self._init_gate_passed = False  # True only if IsInstructionsComplete=true
+        self._agent_manager_email = None  # The manager from the SP list
+        self._agent_instructions = None  # Instructions from the SP list
+        self._agent_user_id = None  # The agent's own user ID
     
     def _create_chat_client(self, model_config: Optional[AzureOpenAIModelConfig] = None) -> None:
         """
@@ -258,6 +272,16 @@ class ContosoAgent(AgentBase):
                 error_str = str(e).lower()
                 last_error = e
                 
+                # Content filter errors are NOT retryable — raise immediately
+                is_content_filter = (
+                    "content_filter" in error_str or
+                    "content management policy" in error_str or
+                    "responsibleaipolicyviolation" in error_str
+                )
+                if is_content_filter:
+                    logger.error("🚫 Content filter rejection — not retryable")
+                    raise
+                
                 # Check if it's a rate limiting error (429)
                 is_rate_limit = (
                     "429" in error_str or 
@@ -299,6 +323,395 @@ class ContosoAgent(AgentBase):
         raise last_error or Exception("All models failed")
     
     # =========================================================================
+    # DIRECT GRAPH API (fully deterministic, no LLM)
+    # =========================================================================
+
+    _GRAPH_BASE = "https://graph.microsoft.com/v1.0"
+    _SP_SITE_URL = "https://m365cpi76377892.sharepoint.com/sites/Contoso"
+
+    # Power Automate flow URL for SharePoint list operations.
+    # Set via SP_FLOW_URL env var.  The flow handles GET (query) and
+    # POST (create) operations for the AgentUsersInstructions list.
+    _SP_FLOW_URL = os.environ.get("SP_FLOW_URL", "")
+
+    async def _get_graph_token(
+        self,
+        auth: Authorization,
+        auth_handler_name: Optional[str],
+        context: TurnContext,
+    ) -> Optional[str]:
+        """Exchange the agentic token for a Microsoft Graph API token."""
+        if not auth_handler_name:
+            return None
+        try:
+            token_result = await auth.exchange_token(
+                context,
+                scopes=["https://graph.microsoft.com/.default"],
+                auth_handler_id=auth_handler_name,
+            )
+            if token_result and hasattr(token_result, "token") and token_result.token:
+                logger.info("✅ Graph API token obtained")
+                return token_result.token
+        except Exception as e:
+            logger.warning(f"⚠️ Graph token exchange failed: {e}")
+        return None
+
+    async def _graph_request(
+        self, method: str, path: str, token: str, body: Optional[dict] = None
+    ) -> Optional[dict]:
+        """Make a request to the Microsoft Graph API. Returns JSON or None."""
+        url = f"{self._GRAPH_BASE}{path}"
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        }
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.request(
+                    method, url, json=body, headers=headers
+                ) as resp:
+                    if resp.status in (200, 201):
+                        return await resp.json()
+                    text = await resp.text()
+                    logger.error(
+                        f"Graph {method} {path}: {resp.status} — {text[:300]}"
+                    )
+        except Exception as e:
+            logger.error(f"Graph {method} {path} exception: {e}")
+        return None
+
+    # =========================================================================
+    # INITIALIZATION GATE (deterministic, code-enforced via Power Automate)
+    # =========================================================================
+
+    async def _ensure_init_gate(
+        self,
+        auth: Authorization,
+        auth_handler_name: Optional[str],
+        context: TurnContext,
+    ) -> tuple[bool, str]:
+        """
+        Deterministic initialization gate. Returns (passed, message).
+
+        Uses a Power Automate flow for all SharePoint list operations and
+        Graph API only for read-only profile lookups (GET /me, GET /me/manager).
+        """
+        # Always get a Graph token (needed for sender identity resolution)
+        graph_token = await self._get_graph_token(auth, auth_handler_name, context)
+
+        # Cached: already passed — just verify sender
+        if self._init_gate_checked and self._init_gate_passed:
+            return await self._check_sender_is_manager(context, graph_token)
+
+        # NOT passed yet (first time OR still pending) — always re-query
+        # the flow so we pick up changes the manager made in SharePoint.
+
+        if not graph_token:
+            return False, (
+                "Hi! I couldn't obtain an authentication token. "
+                "Please try again or contact an administrator."
+            )
+
+        # First time — ensure MCP is ready (needed for Teams notification later)
+        await self._ensure_mcp_initialized(auth, auth_handler_name, context)
+
+        # Get agent UPN from Graph
+        profile = await self._graph_request("GET", "/me", graph_token)
+        if not profile or not profile.get("userPrincipalName"):
+            return False, (
+                "Hi! I couldn't retrieve my profile. "
+                "Please try again or contact an administrator."
+            )
+        agent_upn = profile["userPrincipalName"]
+        logger.info(f"🔍 Init gate: agent UPN = {agent_upn}")
+
+        # Query SP list via flow, passing the Graph token for authorization
+        return await self._init_gate_via_flow(agent_upn, graph_token, context)
+
+    # ------------------------------------------------------------------
+    # Power Automate flow path (fully deterministic, no LLM)
+    # ------------------------------------------------------------------
+
+    async def _flow_request(self, payload: dict, token: str = "") -> Optional[dict]:
+        """Call the Power Automate flow. Returns parsed JSON or None.
+
+        The flow trigger is set to "Anyone" — the URL itself contains a SAS
+        signature and acts as the authentication secret.  The Graph token is
+        passed inside the JSON body (not as an Authorization header) so the
+        flow can use it for internal Graph/SharePoint calls if needed.
+        """
+        if not self._SP_FLOW_URL:
+            logger.error(
+                "❌ SP_FLOW_URL not set. "
+                "Cannot perform SharePoint list operations without the flow URL."
+            )
+            return None
+
+        # Include token in body so the flow can use it internally
+        if token:
+            payload = {**payload, "token": token}
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    self._SP_FLOW_URL,
+                    json=payload,
+                    headers={"Content-Type": "application/json"},
+                    timeout=aiohttp.ClientTimeout(total=30),
+                ) as resp:
+                    body = await resp.text()
+                    if resp.status in (200, 201, 202):
+                        try:
+                            return json.loads(body)
+                        except json.JSONDecodeError:
+                            logger.info(f"✅ Flow returned non-JSON: {body[:200]}")
+                            return {"success": True, "raw": body}
+                    else:
+                        logger.error(
+                            f"❌ Flow returned HTTP {resp.status}: {body[:300]}"
+                        )
+        except Exception as e:
+            logger.error(f"❌ Flow call failed: {e}")
+        return None
+
+    async def _init_gate_via_flow(
+        self,
+        agent_upn: str,
+        graph_token: str,
+        context: TurnContext,
+    ) -> tuple[bool, str]:
+        """
+        Query the SP list via Power Automate flow, evaluate the result,
+        and create a new entry if the agent is not found.
+        """
+        # 1. Query list items filtered by agentUserId
+        result = await self._flow_request({
+            "action": "get",
+            "agentUserId": agent_upn,
+        }, token=graph_token)
+
+        if result is None:
+            return False, (
+                "Hi! I couldn't check my setup status. "
+                "Please try again or contact an administrator."
+            )
+
+        items = result.get("value", [])
+
+        # 2. Find agent's own entry
+        my_entry = None
+        if isinstance(items, list):
+            for item in items:
+                fields = item if isinstance(item, dict) else {}
+                uid = fields.get("agentUserId", "")
+                if uid and uid.lower() == agent_upn.lower():
+                    my_entry = fields
+                    break
+
+        # 3. Resolve manager from Graph (always reliable)
+        manager_email = await self._resolve_manager_email(graph_token)
+
+        # 4. Evaluate
+        if my_entry:
+            is_complete = my_entry.get("IsInstructionsComplete", False)
+            has_instructions = bool(
+                my_entry.get("Instructions", "").strip()
+            )
+            if is_complete or has_instructions:
+                # READY ✅  (flag set OR instructions text present)
+                self._init_gate_checked = True
+                self._init_gate_passed = True
+                self._agent_user_id = agent_upn
+                self._agent_manager_email = manager_email
+                self._agent_instructions = my_entry.get("Instructions", "")
+                logger.info(
+                    f"✅ Init gate PASSED. Manager: {self._agent_manager_email}"
+                )
+                return await self._check_sender_is_manager(context, graph_token)
+            else:
+                # PENDING ⏳  (no flag AND no instructions text)
+                self._init_gate_checked = True
+                self._init_gate_passed = False
+                self._agent_manager_email = manager_email
+                logger.info("⏳ Init gate: PENDING (instructions not complete)")
+                return False, (
+                    "Hi! My setup is still pending — my manager needs to complete "
+                    "the instructions before I can assist anyone.\n\n"
+                    "I've already notified them. Please check with my manager if you'd "
+                    "like to expedite this."
+                )
+        else:
+            # NOT FOUND — create entry via flow + notify manager
+            return await self._init_gate_create_via_flow(
+                agent_upn, graph_token, manager_email, context
+            )
+
+    async def _resolve_manager_email(self, token: str) -> str:
+        """Resolve the agent's manager email via Graph API (GET /me/manager)."""
+        manager_data = await self._graph_request("GET", "/me/manager", token)
+        if not manager_data:
+            return ""
+        email = (
+            manager_data.get("mail")
+            or manager_data.get("userPrincipalName", "")
+        )
+        return (email or "").strip().lower()
+
+    async def _init_gate_create_via_flow(
+        self,
+        agent_upn: str,
+        graph_token: str,
+        manager_email: str,
+        context: TurnContext,
+    ) -> tuple[bool, str]:
+        """Create the SP list entry via flow + notify manager via Teams."""
+        # Get manager display name from Graph
+        manager_data = await self._graph_request("GET", "/me/manager", graph_token)
+        manager_name = manager_data.get("displayName", "") if manager_data else ""
+        logger.info(f"📝 Agent manager: {manager_name} ({manager_email})")
+
+        # Create SP list item via flow
+        create_result = await self._flow_request({
+            "action": "create",
+            "agentUserId": agent_upn,
+            "isInstructionsComplete": False,
+        }, token=graph_token)
+        if create_result:
+            logger.info(f"✅ SP list item created via flow for {agent_upn}")
+        else:
+            logger.error("❌ Failed to create SP list item via flow")
+
+        self._init_gate_checked = True
+        self._init_gate_passed = False
+        self._agent_manager_email = manager_email
+
+        # Check if sender is the manager — if so, give them a direct link
+        # instead of sending a redundant Teams DM to themselves.
+        sender_is_manager = False
+        if manager_email and graph_token:
+            passed, _ = await self._check_sender_is_manager(context, graph_token)
+            sender_is_manager = passed
+
+        setup_link = f"{self._SP_SITE_URL}/Lists/AgentUsersInstructions"
+
+        if sender_is_manager:
+            logger.info("✅ Sender is the manager — skipping Teams DM, giving direct link")
+            return False, (
+                f"Hi {manager_name or 'there'}! I've just been activated and my "
+                f"profile has been created in the setup list.\n\n"
+                f"Please go to {setup_link} and fill in the **Instructions** "
+                f"for my entry, then send me another message and I'll be ready to help!"
+            )
+
+        # Sender is NOT the manager — notify manager via Teams
+        if manager_email:
+            await self._notify_manager_via_teams(agent_upn, manager_email, manager_name)
+
+        manager_display = manager_name or manager_email or "your manager"
+        return False, (
+            f"Hi! I need to get set up before I can help. I've notified my "
+            f"manager ({manager_display}) to complete the required setup instructions "
+            f"for my profile.\n\n"
+            f"Once my manager fills in the instructions, I'll be fully ready "
+            f"to assist. Please reach out to them if you'd like to speed things up!"
+        )
+
+    async def _notify_manager_via_teams(
+        self, agent_upn: str, manager_email: str, manager_name: str
+    ) -> None:
+        """Send a Teams message to the manager. Uses LLM since Teams MCP works fine."""
+        greeting = f" {manager_name}" if manager_name else ""
+        prompt = (
+            f"Send a Teams message to {manager_email}. "
+            f"Use createChat with their email, then postMessage with this text:\n\n"
+            f'"Hi{greeting}! I\'m the Contoso Assistant agent ({agent_upn}). '
+            f"I've just been activated but don't have instructions set up yet. "
+            f"Could you please go to {self._SP_SITE_URL}/Lists/AgentUsersInstructions "
+            f"and fill in my instructions? I won't be able to assist anyone until "
+            f'that\'s complete. Thank you!"\n\n'
+            f"After sending, return only: done"
+        )
+        try:
+            async with asyncio.timeout(60):
+                await self._run_with_failover(prompt)
+                logger.info(f"✅ Teams notification sent to {manager_email}")
+        except asyncio.TimeoutError:
+            logger.warning(f"⚠️ Teams notification to {manager_email} timed out (message may still have been delivered)")
+        except Exception as e:
+            logger.error(f"❌ Failed to notify manager via Teams: {e}")
+
+    # ------------------------------------------------------------------
+    # Sender authorization check
+    # ------------------------------------------------------------------
+
+    async def _check_sender_is_manager(
+        self, context: TurnContext, graph_token: str | None = None
+    ) -> tuple[bool, str]:
+        """
+        Check if the person who sent the message is the agent's assigned manager.
+        Resolves the sender's AAD object ID to an email via Graph if needed.
+        Returns (passed, message).
+        """
+        if not self._agent_manager_email:
+            # No manager set — can't verify, allow through
+            logger.warning("⚠️ No manager email set, allowing request through")
+            return True, ""
+
+        # Extract all available sender identifiers
+        sender_email = ""
+        sender_aad_id = ""
+        sender_raw_id = ""
+        if context.activity.from_property:
+            sender_raw_id = getattr(context.activity.from_property, "id", "") or ""
+            sender_aad_id = (
+                getattr(context.activity.from_property, "aad_object_id", "") or ""
+            )
+
+        # If the raw id looks like an email, use it directly
+        if "@" in sender_raw_id:
+            sender_email = sender_raw_id.strip().lower()
+        elif sender_aad_id and graph_token:
+            # Resolve AAD object ID → email via Graph
+            user_data = await self._graph_request(
+                "GET", f"/users/{sender_aad_id}", graph_token
+            )
+            if user_data:
+                sender_email = (
+                    user_data.get("mail")
+                    or user_data.get("userPrincipalName", "")
+                ).strip().lower()
+                logger.info(
+                    f"🔍 Resolved sender AAD {sender_aad_id} → {sender_email}"
+                )
+        elif sender_aad_id:
+            # No token to resolve — try the orgid pattern
+            sender_email = sender_aad_id.strip().lower()
+
+        if not sender_email:
+            logger.warning(
+                f"⚠️ Could not resolve sender identity "
+                f"(id={sender_raw_id}, aad={sender_aad_id}), allowing through"
+            )
+            return True, ""
+
+        # Compare sender to manager (case-insensitive)
+        manager = self._agent_manager_email.lower()
+
+        if sender_email == manager or manager in sender_email or sender_email in manager:
+            logger.info(f"✅ Sender ({sender_email}) is the assigned manager")
+            return True, ""
+
+        logger.info(
+            f"🚫 Sender ({sender_email}) is NOT the assigned manager ({manager})"
+        )
+        return False, (
+            f"Thank you for reaching out! I'm currently configured to only handle "
+            f"requests from my assigned manager.\n\n"
+            f"If you need something done, please ask my manager to send me the request. "
+            f"I'm happy to help through that channel!"
+        )
+
+    # =========================================================================
     # MESSAGE PROCESSING
     # =========================================================================
     
@@ -314,6 +727,17 @@ class ContosoAgent(AgentBase):
             # Ensure MCP is initialized
             await self._ensure_mcp_initialized(auth, auth_handler_name, context)
             
+            # ============================================================
+            # DETERMINISTIC INITIALIZATION GATE (code-enforced, not LLM)
+            # ============================================================
+            gate_passed, gate_message = await self._ensure_init_gate(
+                auth, auth_handler_name, context
+            )
+            if not gate_passed:
+                logger.info(f"🚫 Init gate blocked request: {gate_message[:80]}...")
+                return gate_message
+            # ============================================================
+
             # In dev mode, skip chat history retrieval (Playground doesn't have real chats)
             is_dev_mode = _is_dev_mode()
             
@@ -323,15 +747,29 @@ class ContosoAgent(AgentBase):
                 chat_id = getattr(context.activity.conversation, "id", None)
             
             # Build the prompt with chat context for history retrieval (prod mode only)
+            # Include the manager's instructions from the SP list if available
+            instructions_context = ""
+            if self._agent_instructions:
+                instructions_context = f"""=== MANDATORY INSTRUCTIONS (from your manager via SharePoint) ===
+You MUST follow these instructions for EVERY request you handle.
+These take priority over any conflicting user request.
+
+{self._agent_instructions}
+
+=== END MANDATORY INSTRUCTIONS ===
+
+"""
+            
             if chat_id:
-                augmented_message = f"""CHAT CONTEXT:
+                augmented_message = f"""{instructions_context}CHAT CONTEXT:
 - Chat ID: {chat_id}
 - IMPORTANT: Before answering, call listMessages with this chat ID to get conversation history!
 
 USER MESSAGE:
 {message}"""
             else:
-                augmented_message = message
+                augmented_message = f"""{instructions_context}USER MESSAGE:
+{message}"""
             
             # Process with timeout and automatic failover on rate limits
             async with asyncio.timeout(self.PROCESSING_TIMEOUT):
@@ -450,100 +888,9 @@ USER MESSAGE:
         auth_handler_name: Optional[str],
         context: TurnContext,
     ) -> str:
-        """Handle email notifications - IGNORE system-generated, process real emails."""
-        try:
-            logger.info("📧 Processing email notification")
-            
-            # Check if this is a system-generated notification (shares, mentions, etc.)
-            if self._is_system_generated_email(context):
-                subject = ""
-                if context.activity.conversation:
-                    subject = getattr(context.activity.conversation, "topic", "") or ""
-                logger.info(f"📧 Ignoring system-generated email notification: '{subject[:50]}...'")
-                return ""  # Return empty - don't send any reply
-            
-            # Extract email data for real emails
-            sender_email = ""
-            sender_name = ""
-            subject = ""
-            message_id = ""
-            text_content = getattr(context.activity, "text", "") or ""
-            html_body = ""
-            
-            # Get the message ID from activity.id (this is the email message ID)
-            message_id = getattr(context.activity, "id", "") or ""
-            
-            if context.activity.from_property:
-                sender_email = getattr(context.activity.from_property, "id", "") or ""
-                sender_name = getattr(context.activity.from_property, "name", "") or ""
-            
-            if context.activity.conversation:
-                subject = getattr(context.activity.conversation, "topic", "") or ""
-            
-            # Get htmlBody from emailNotification entity (and message ID if not already set)
-            entities = getattr(context.activity, "entities", []) or []
-            for entity in entities:
-                entity_type = getattr(entity, "type", "") if hasattr(entity, "type") else entity.get("type", "")
-                if entity_type == "emailNotification":
-                    if hasattr(entity, "htmlBody"):
-                        html_body = entity.htmlBody
-                    elif isinstance(entity, dict):
-                        html_body = entity.get("htmlBody", "")
-                    # Also get message ID from entity if not already set
-                    if not message_id:
-                        if hasattr(entity, "id"):
-                            message_id = entity.id
-                        elif isinstance(entity, dict):
-                            message_id = entity.get("id", "")
-                    break
-            
-            # Use the best available content
-            email_content = html_body[:3000] if html_body else text_content[:3000]
-            
-            logger.info(f"📧 Real email from {sender_name} ({sender_email}): '{subject[:50]}...'")
-            logger.info(f"📧 Message ID: {message_id[:50]}..." if message_id else "📧 No message ID found")
-            
-            # Initialize MCP for full tool access
-            await self._ensure_mcp_initialized(auth, auth_handler_name, context)
-            
-            # Let the AI decide what to do based on the email content
-            message = f"""You received a real email from a person. Analyze it and respond appropriately.
-
-FROM: {sender_name} <{sender_email}>
-SUBJECT: {subject}
-MESSAGE_ID: {message_id}
-
-EMAIL CONTENT:
-{email_content}
-
-INSTRUCTIONS:
-- This is a real email from a human, not a system notification
-- Analyze what the sender is asking or telling you
-- If they're asking a question, answer it directly
-- If they're asking you to do something (send email, schedule meeting, look up info, etc.), USE YOUR TOOLS to do it
-- To reply to this email:
-  * Use **ReplyAllToMessageAsync** if the sender uses words like "us", "we", "team", or if there are CC recipients (default choice)
-  * Use ReplyToMessageAsync only if the message is clearly personal/private to the sender alone
-  * Pass the MESSAGE_ID above as the 'id' parameter
-- If it's just informational with no action needed, acknowledge it briefly
-- Be helpful and take action when appropriate
-
-Respond and take any necessary actions."""
-            
-            try:
-                async with asyncio.timeout(self.PROCESSING_TIMEOUT):
-                    response = await self._run_with_failover(message)
-                    
-                logger.info(f"📧 Email processed: {response[:100] if response else 'No response'}...")
-                return response or "Email processed."
-                
-            except asyncio.TimeoutError:
-                logger.warning("Email processing timeout")
-                return "Thank you for your email. I've received it and will review it shortly."
-            
-        except Exception as e:
-            logger.error(f"Email notification error: {e}")
-            return "Thank you for your email. I encountered an issue but will review it."
+        """Handle email notifications — ALL emails are blocked. Agent only operates via Teams."""
+        logger.info("📧 Email notification received — BLOCKED (agent only responds via Teams)")
+        return ""  # Return empty — do not reply to any email
     
     async def handle_word_notification(
         self,
