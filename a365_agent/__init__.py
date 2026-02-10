@@ -22,11 +22,14 @@ Usage:
 
 from a365_agent.base import AgentBase
 from a365_agent.host import GenericAgentHost, create_and_run_host
+from a365_agent.proactive import ProactiveScheduler, ProactiveTokenProvider
 
 __all__ = [
     "AgentBase",
     "GenericAgentHost",
     "create_and_run_host",
+    "ProactiveScheduler",
+    "ProactiveTokenProvider",
 ]
 
 __version__ = "0.1.0"

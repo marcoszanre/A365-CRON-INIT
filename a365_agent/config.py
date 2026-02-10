@@ -45,23 +45,33 @@ class AzureOpenAIModelPool:
     Pool of Azure OpenAI models with round-robin load balancing and failover.
     
     Automatically rotates through available models and skips throttled ones.
+    Supports a configurable env-var prefix so the same class powers both the
+    default (MCP-init) pool and the planning (reasoning/execution) pool.
     """
     
-    def __init__(self):
+    def __init__(self, env_prefix: str = "AZURE_OPENAI_MODEL", label: str = "default"):
+        """
+        Args:
+            env_prefix: Prefix for numbered env vars.
+                        Default pool  -> AZURE_OPENAI_MODEL_N_*
+                        Planning pool -> AZURE_OPENAI_PLANNING_MODEL_N_*
+            label: Human-readable name used in log messages.
+        """
         self.models: list[AzureOpenAIModelConfig] = []
         self._current_index = 0
         self._throttled_until: dict[int, float] = {}  # model_index -> timestamp
-        self._load_models_from_env()
+        self._label = label
+        self._load_models_from_env(env_prefix)
     
-    def _load_models_from_env(self) -> None:
+    def _load_models_from_env(self, env_prefix: str) -> None:
         """Load all models from environment variables."""
         api_version = os.getenv("AZURE_OPENAI_API_VERSION", "2024-05-01-preview")
         
-        # Load numbered models (AZURE_OPENAI_MODEL_1_*, AZURE_OPENAI_MODEL_2_*, etc.)
+        # Load numbered models ({PREFIX}_1_*, {PREFIX}_2_*, etc.)
         for i in range(1, 20):  # Support up to 20 models
-            endpoint = os.getenv(f"AZURE_OPENAI_MODEL_{i}_ENDPOINT")
-            deployment = os.getenv(f"AZURE_OPENAI_MODEL_{i}_DEPLOYMENT")
-            api_key = os.getenv(f"AZURE_OPENAI_MODEL_{i}_API_KEY")
+            endpoint = os.getenv(f"{env_prefix}_{i}_ENDPOINT")
+            deployment = os.getenv(f"{env_prefix}_{i}_DEPLOYMENT")
+            api_key = os.getenv(f"{env_prefix}_{i}_API_KEY")
             
             if endpoint and deployment and api_key:
                 model = AzureOpenAIModelConfig(
@@ -71,27 +81,37 @@ class AzureOpenAIModelPool:
                     api_version=api_version,
                 )
                 self.models.append(model)
-                logger.info(f"📦 Loaded model {i}: {model.name}")
+                logger.info(f"📦 [{self._label}] Loaded model {i}: {model.name}")
         
         # Fallback to legacy single-model config if no numbered models found
         if not self.models:
-            endpoint = os.getenv("AZURE_OPENAI_ENDPOINT", "")
-            deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT", "")
-            api_key = os.getenv("AZURE_OPENAI_API_KEY", "")
+            # For planning pool, try AZURE_OPENAI_PLANNING_* single vars
+            if env_prefix == "AZURE_OPENAI_PLANNING_MODEL":
+                endpoint = os.getenv("AZURE_OPENAI_PLANNING_ENDPOINT", "")
+                deployment = os.getenv("AZURE_OPENAI_PLANNING_DEPLOYMENT", "")
+                api_key = os.getenv("AZURE_OPENAI_PLANNING_API_KEY", "")
+                api_ver = os.getenv(
+                    "AZURE_OPENAI_PLANNING_API_VERSION", api_version
+                )
+            else:
+                endpoint = os.getenv("AZURE_OPENAI_ENDPOINT", "")
+                deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT", "")
+                api_key = os.getenv("AZURE_OPENAI_API_KEY", "")
+                api_ver = api_version
             
             if endpoint and deployment and api_key:
                 model = AzureOpenAIModelConfig(
                     endpoint=endpoint,
                     deployment=deployment,
                     api_key=api_key,
-                    api_version=api_version,
+                    api_version=api_ver,
                 )
                 self.models.append(model)
-                logger.info(f"📦 Loaded legacy model: {model.name}")
+                logger.info(f"📦 [{self._label}] Loaded single model: {model.name}")
         
         if self.models:
-            logger.info(f"✅ Model pool initialized with {len(self.models)} models")
-        else:
+            logger.info(f"✅ [{self._label}] Pool initialized with {len(self.models)} model(s)")
+        elif self._label == "default":
             logger.warning("⚠️ No Azure OpenAI models configured!")
     
     def get_next_model(self) -> AzureOpenAIModelConfig:
@@ -188,6 +208,24 @@ class AzureOpenAISettings:
     def is_valid(self) -> bool:
         """Check if settings are valid."""
         return bool(self.endpoint and self.deployment and self.api_version)
+
+
+def _load_planning_pool() -> Optional[AzureOpenAIModelPool]:
+    """
+    Load the planning model pool from AZURE_OPENAI_PLANNING_MODEL_N_* env vars.
+    Falls back to the single AZURE_OPENAI_PLANNING_* vars if no numbered ones exist.
+    
+    The planning pool contains the "smart" models used for actual reasoning,
+    planning, and tool execution AFTER MCP tools have been registered with
+    the cheaper default pool.
+    
+    Returns None if not configured (agent will use the default pool for everything).
+    """
+    pool = AzureOpenAIModelPool(
+        env_prefix="AZURE_OPENAI_PLANNING_MODEL",
+        label="planning",
+    )
+    return pool if pool.models else None
 
 
 @dataclass
@@ -296,8 +334,11 @@ class Settings:
     server: ServerSettings = field(default_factory=ServerSettings)
     mcp: MCPSettings = field(default_factory=MCPSettings)
     
-    # Model pool for load balancing (not a dataclass field - initialized separately)
+    # Default model pool for MCP init / load balancing
     model_pool: Optional[AzureOpenAIModelPool] = field(default=None, repr=False)
+    
+    # Planning model pool (smarter models for reasoning/execution after MCP init)
+    planning_pool: Optional[AzureOpenAIModelPool] = field(default=None, repr=False)
     
     # Development settings
     bearer_token: str = ""
@@ -310,8 +351,13 @@ class Settings:
         self.use_agentic_auth = os.getenv("USE_AGENTIC_AUTH", "true").lower() == "true"
         self.log_level = os.getenv("LOG_LEVEL", "INFO")
         
-        # Initialize the model pool for multi-model load balancing
-        self.model_pool = AzureOpenAIModelPool()
+        # Initialize the default model pool for MCP init & load balancing
+        self.model_pool = AzureOpenAIModelPool(
+            env_prefix="AZURE_OPENAI_MODEL", label="default"
+        )
+        
+        # Initialize the planning pool (used for reasoning after MCP tools are registered)
+        self.planning_pool = _load_planning_pool()
     
     @classmethod
     def from_environment(cls) -> "Settings":

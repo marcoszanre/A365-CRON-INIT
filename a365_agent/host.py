@@ -17,6 +17,7 @@ import asyncio
 import logging
 import socket
 import uuid
+import os
 from os import environ
 from typing import Optional, Type
 
@@ -32,6 +33,7 @@ from a365_agent.notifications import (
     safe_send_email_response,
 )
 from a365_agent.observability import ObservabilityContext, configure_observability
+from a365_agent.proactive.scheduler import ProactiveScheduler
 
 # Microsoft Agents SDK imports
 from microsoft_agents.activity import load_configuration_from_env
@@ -121,8 +123,8 @@ class GenericAgentHost(NotificationHandlerMixin):
     """
     
     # Processing timeout constants
-    FIRST_REQUEST_TIMEOUT = 120  # 2 minutes for first request (MCP init)
-    NORMAL_REQUEST_TIMEOUT = 90  # 90 seconds for normal requests
+    FIRST_REQUEST_TIMEOUT = 180  # 3 minutes for first request (MCP init)
+    NORMAL_REQUEST_TIMEOUT = 150  # 2.5 minutes for normal requests (must be > agent's PROCESSING_TIMEOUT)
     
     def __init__(
         self,
@@ -175,6 +177,10 @@ class GenericAgentHost(NotificationHandlerMixin):
         
         # Notification dispatcher
         self.agent_notification = AgentNotification(self.agent_app)
+        
+        # Proactive scheduler (cron)
+        self._cron_scheduler: Optional[ProactiveScheduler] = None
+        self._cron_task: Optional[asyncio.Task] = None
         
         # Register all handlers
         self._setup_handlers()
@@ -555,12 +561,16 @@ class GenericAgentHost(NotificationHandlerMixin):
                                 self.auth_handler_name,
                                 context,
                             )
-                            await context.send_activity(response)
+                            # Only send if response is meaningful and agent didn't
+                            # already post via MCP postMessage tool
+                            if response and response.strip():
+                                await context.send_activity(response)
+                                logger.info("✅ Response sent")
+                            else:
+                                logger.info("✅ Agent handled request (response sent via MCP tools)")
                             
                             if is_first_request:
                                 logger.info("✅ First request completed - MCP initialized")
-                            else:
-                                logger.info("✅ Response sent")
                                 
                     except asyncio.TimeoutError:
                         logger.warning(f"⏳ Request timed out after {timeout}s")
@@ -578,15 +588,32 @@ class GenericAgentHost(NotificationHandlerMixin):
     # =========================================================================
     
     async def initialize_agent(self) -> None:
-        """Initialize the agent instance."""
+        """Initialize the agent instance and start the proactive scheduler if enabled."""
         if self.agent_instance is None:
             logger.info(f"🤖 Initializing {self.agent_class.__name__}...")
             self.agent_instance = self.agent_class(*self.agent_args, **self.agent_kwargs)
             await self.agent_instance.initialize()
             logger.info(f"✅ {self.agent_class.__name__} initialized")
+        
+        # Start proactive cron scheduler if enabled
+        cron_enabled = os.getenv("CRON_ENABLED", "false").lower() == "true"
+        if cron_enabled:
+            self._cron_scheduler = ProactiveScheduler()
+            self._cron_task = asyncio.create_task(self._cron_scheduler.start())
+            logger.info("⏰ Proactive cron scheduler launched as background task")
+        else:
+            logger.info("⏰ Proactive cron scheduler disabled (set CRON_ENABLED=true to enable)")
     
     async def cleanup(self) -> None:
         """Clean up resources."""
+        # Stop cron scheduler
+        if self._cron_scheduler:
+            try:
+                await self._cron_scheduler.stop()
+                logger.info("⏰ Proactive cron scheduler stopped")
+            except Exception as e:
+                logger.error(f"Cron scheduler cleanup error: {e}")
+        
         if self.agent_instance:
             try:
                 await self.agent_instance.cleanup()
@@ -680,13 +707,17 @@ class GenericAgentHost(NotificationHandlerMixin):
                 port = port + 1
         
         # Print startup banner
+        cron_enabled = os.getenv("CRON_ENABLED", "false").lower() == "true"
+        cron_interval = os.getenv("CRON_INTERVAL_SECONDS", "3600")
+        
         print("=" * 80)
         print(f"🏢 {self.agent_class.__name__}")
         print("=" * 80)
         print(f"🔒 Auth: {'Enabled' if auth_configuration else 'Anonymous'}")
         print(f"🚀 Server: localhost:{port}")
         print(f"📚 Endpoint: http://localhost:{port}/api/messages")
-        print(f"❤️  Health: http://localhost:{port}/api/health\n")
+        print(f"❤️  Health: http://localhost:{port}/api/health")
+        print(f"⏰ Cron: {'Enabled (every ' + cron_interval + 's)' if cron_enabled else 'Disabled'}\n")
         
         try:
             run_app(app, host="localhost", port=port, handle_signals=True)
