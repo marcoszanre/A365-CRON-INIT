@@ -3,20 +3,17 @@
 """
 Scheduled Task Management Tools
 
-Local FunctionTool definitions that let the agent manage its own scheduled
-tasks in PostgreSQL. The cron scheduler picks up these tasks and executes
-them autonomously on each tick.
+Local FunctionTool definitions for managing cron-scheduled tasks in PostgreSQL.
+The agent uses these tools to create, list, update, and delete tasks that the
+background cron scheduler picks up and executes autonomously.
 
-These tools are scoped to the agent's own UPN — an agent can only see and
-manage its own tasks. The tools are created as closures so the ``agent_upn``
-is captured at registration time.
+Scoped per agent UPN — each agent can only manage its own tasks.
 
 Usage:
     tools = create_task_tools(agent_upn="UPN.agent@tenant.onmicrosoft.com")
-    # Then add to agent: agent.default_options.setdefault("tools", []).extend(tools)
+    # Then register on agent: agent.default_options["tools"].extend(tools)
 """
 
-import json
 import logging
 from typing import Annotated, Optional
 
@@ -27,11 +24,9 @@ logger = logging.getLogger(__name__)
 
 def create_task_tools(agent_upn: str) -> list:
     """
-    Create task management FunctionTool instances scoped to ``agent_upn``.
+    Create task-management FunctionTools scoped to *agent_upn*.
 
-    Returns a list of tools that can be added to a ChatAgent's tool list.
-    The agent_upn is captured in closures so the tools are scoped to that
-    specific agent.
+    Returns a list of tools to register on a ChatAgent.
     """
 
     # ------------------------------------------------------------------
@@ -39,120 +34,198 @@ def create_task_tools(agent_upn: str) -> list:
     # ------------------------------------------------------------------
     @tool(name="list_my_scheduled_tasks", approval_mode="never_require")
     async def list_my_scheduled_tasks() -> str:
-        """List all scheduled tasks assigned to me in the PostgreSQL database.
-        Returns task details including task_id, name, prompt, enabled status,
-        last run time, and last status. Use this to check what cron jobs are
-        registered for execution."""
+        """Retrieve every scheduled task that belongs to this agent from the
+        PostgreSQL database (both enabled and disabled).
+
+        Returns a formatted list with each task's task_id, name, prompt,
+        enabled/disabled status, last execution time, and last execution
+        result.
+
+        Call this tool when:
+        - The user asks "what tasks do I have?" or "show my tasks"
+        - You need to look up a task_id before updating or deleting a task
+        - The user wants to verify a task was created
+
+        This tool takes NO parameters — it automatically filters to the
+        current agent's tasks."""
         from a365_agent.storage import get_storage
 
         storage = await get_storage()
         tasks = await storage.get_all_tasks_for_agent(agent_upn)
         if not tasks:
-            return "No scheduled tasks found. You can create one with create_scheduled_task."
+            return "You have no scheduled tasks yet."
 
-        result_lines = [f"Found {len(tasks)} task(s):\n"]
-        for t in tasks:
-            enabled = "✅ enabled" if t.get("is_enabled") else "❌ disabled"
-            last_run = t.get("last_run_at") or "never"
-            last_status = t.get("last_status") or "n/a"
-            result_lines.append(
-                f"• **{t['task_name']}** ({enabled})\n"
-                f"  task_id: {t['task_id']}\n"
-                f"  prompt: {t.get('task_prompt', '')[:120]}...\n"
-                f"  last_run: {last_run} | status: {last_status}"
+        lines = []
+        for i, t in enumerate(tasks, 1):
+            status = "Enabled" if t.get("is_enabled") else "Disabled"
+            last_run = str(t.get("last_run_at") or "Never run")
+            last_status = t.get("last_status") or "-"
+            prompt_preview = (t.get("task_prompt") or "")[:100]
+            lines.append(
+                f"{i}. {t['task_name']} ({status})\n"
+                f"   ID: {t['task_id']}\n"
+                f"   Prompt: {prompt_preview}\n"
+                f"   Last run: {last_run} ({last_status})"
             )
-        return "\n".join(result_lines)
+        return f"Your scheduled tasks ({len(tasks)}):\n\n" + "\n\n".join(lines)
 
     # ------------------------------------------------------------------
     # create_scheduled_task
     # ------------------------------------------------------------------
     @tool(name="create_scheduled_task", approval_mode="never_require")
     async def create_scheduled_task(
-        task_name: Annotated[str, "Short name for the task (e.g. 'weekly_report', 'daily_inbox_check')"],
-        task_prompt: Annotated[str, "The prompt that describes what the task should do. "
-                     "Supports {manager_email}, {agent_upn}, {timestamp} placeholders."],
-        is_recurrent: Annotated[bool, "True if the task should repeat on each cron tick, "
-                      "False for a one-time task"] = True,
+        task_name: Annotated[
+            str,
+            "A short snake_case name for the task, e.g. 'weekly_report' or 'happiness_quote'.",
+        ],
+        task_prompt: Annotated[
+            str,
+            "The full prompt the cron agent will execute. Write it as a complete "
+            "instruction, e.g. 'Send a Teams message to {manager_email} with an "
+            "inspiring quote about happiness.' "
+            "Supported placeholders (auto-resolved at runtime): "
+            "{manager_email} = the manager's email, "
+            "{agent_upn} = this agent's UPN, "
+            "{timestamp} = current UTC time. "
+            "DO NOT look up emails before calling this tool — just use the "
+            "placeholders and they will be filled in automatically.",
+        ],
+        is_recurrent: Annotated[
+            bool,
+            "True (default) = repeats every cron interval. "
+            "False = runs once then auto-disables.",
+        ] = True,
     ) -> str:
-        """Create a new scheduled task in the PostgreSQL database. The cron
-        scheduler will execute this task automatically at each interval. One-time
-        tasks (is_recurrent=False) are disabled after their first execution."""
-        from a365_agent.storage import get_storage
+        """Create a new scheduled task in PostgreSQL so the background cron job
+        will execute it automatically on the next interval.
 
-        storage = await get_storage()
-        row = await storage.create_scheduled_task(
-            agent_user_id=agent_upn,
-            task_name=task_name,
-            task_prompt=task_prompt,
-            is_enabled=True,
-        )
-        task_id = row.get("task_id", "unknown")
-        recurrence = "recurrent" if is_recurrent else "one-time"
-        logger.info(f"📋 Task created: {task_name} ({task_id}) for {agent_upn} [{recurrence}]")
-        return (
-            f"Task created successfully!\n"
-            f"• task_id: {task_id}\n"
-            f"• name: {task_name}\n"
-            f"• recurrence: {recurrence}\n"
-            f"• status: enabled\n"
-            f"The cron scheduler will execute this task on the next interval."
-        )
+        IMPORTANT — call this tool IMMEDIATELY when the user asks you to
+        create, schedule, or register a task. Do NOT call getMyProfile,
+        getUserProfile, or any other tool first. The task_prompt supports
+        {manager_email} and other placeholders that are resolved at execution
+        time, so you never need to look up emails beforehand.
+
+        Examples of when to call this tool:
+        - "Create a task to send me a quote about happiness"
+        - "Schedule a weekly report"
+        - "Add a recurring reminder to check my inbox"
+        """
+        try:
+            from a365_agent.storage import get_storage
+
+            logger.info(f"Creating task '{task_name}' for agent {agent_upn}")
+            storage = await get_storage()
+            row = await storage.create_scheduled_task(
+                agent_user_id=agent_upn,
+                task_name=task_name,
+                task_prompt=task_prompt,
+                is_enabled=True,
+            )
+            task_id = row.get("task_id", "unknown")
+            recurrence = "Repeats every cycle" if is_recurrent else "Runs once"
+            logger.info(f"Task created: {task_name} ({task_id}) for {agent_upn}")
+            return (
+                f"Task created: {task_name}\n"
+                f"ID: {task_id}\n"
+                f"Schedule: {recurrence}\n"
+                f"Status: Enabled\n"
+                f"It will run automatically on the next cron cycle."
+            )
+        except Exception as e:
+            logger.error(f"create_scheduled_task failed: {e}")
+            return f"Error creating task: {e}"
 
     # ------------------------------------------------------------------
     # update_scheduled_task
     # ------------------------------------------------------------------
     @tool(name="update_scheduled_task", approval_mode="never_require")
     async def update_scheduled_task(
-        task_id: Annotated[str, "The UUID task_id of the task to update"],
-        task_name: Annotated[Optional[str], "New name for the task (leave empty to keep current)"] = None,
-        task_prompt: Annotated[Optional[str], "New prompt for the task (leave empty to keep current)"] = None,
-        is_enabled: Annotated[Optional[bool], "Set to true to enable or false to disable the task"] = None,
+        task_id: Annotated[
+            str,
+            "The UUID task_id to update. Get it from list_my_scheduled_tasks.",
+        ],
+        task_name: Annotated[
+            Optional[str],
+            "New name for the task. Omit or pass null to keep the current name.",
+        ] = None,
+        task_prompt: Annotated[
+            Optional[str],
+            "New prompt for the task. Omit or pass null to keep the current prompt.",
+        ] = None,
+        is_enabled: Annotated[
+            Optional[bool],
+            "Set true to enable or false to disable the task. "
+            "Omit or pass null to keep the current state.",
+        ] = None,
     ) -> str:
-        """Update an existing scheduled task's name, prompt, or enabled status.
-        Use list_my_scheduled_tasks first to get the task_id."""
-        from a365_agent.storage import get_storage
+        """Update an existing scheduled task's name, prompt, or enabled status
+        in PostgreSQL.
 
-        fields = {}
-        if task_name is not None:
-            fields["task_name"] = task_name
-        if task_prompt is not None:
-            fields["task_prompt"] = task_prompt
-        if is_enabled is not None:
-            fields["is_enabled"] = is_enabled
+        Call this tool when the user wants to:
+        - Rename a task
+        - Change what a task does (update the prompt)
+        - Enable or disable a task without deleting it
 
-        if not fields:
-            return "No fields provided to update. Specify at least one of: task_name, task_prompt, is_enabled."
+        You must provide the task_id. If you don't have it, call
+        list_my_scheduled_tasks first to look it up."""
+        try:
+            from a365_agent.storage import get_storage
 
-        storage = await get_storage()
-        updated = await storage.update_scheduled_task_fields(task_id, **fields)
-        if updated is None:
-            return f"Task with task_id '{task_id}' was not found. Use list_my_scheduled_tasks to see your tasks."
+            fields = {}
+            if task_name is not None:
+                fields["task_name"] = task_name
+            if task_prompt is not None:
+                fields["task_prompt"] = task_prompt
+            if is_enabled is not None:
+                fields["is_enabled"] = is_enabled
 
-        return (
-            f"Task updated successfully!\n"
-            f"• task_id: {task_id}\n"
-            f"• name: {updated.get('task_name')}\n"
-            f"• enabled: {updated.get('is_enabled')}\n"
-            f"Changes will take effect on the next cron tick."
-        )
+            if not fields:
+                return "No fields provided to update. Specify at least one of: task_name, task_prompt, is_enabled."
+
+            storage = await get_storage()
+            updated = await storage.update_scheduled_task_fields(task_id, **fields)
+            if updated is None:
+                return f"Task {task_id} not found. Use list_my_scheduled_tasks to check your tasks."
+
+            status = "Enabled" if updated.get("is_enabled") else "Disabled"
+            return (
+                f"Task updated: {updated.get('task_name')}\n"
+                f"ID: {task_id}\n"
+                f"Status: {status}\n"
+                f"Changes take effect on the next cron cycle."
+            )
+        except Exception as e:
+            logger.error(f"update_scheduled_task failed: {e}")
+            return f"Error updating task: {e}"
 
     # ------------------------------------------------------------------
     # delete_scheduled_task
     # ------------------------------------------------------------------
     @tool(name="delete_scheduled_task", approval_mode="never_require")
     async def delete_scheduled_task(
-        task_id: Annotated[str, "The UUID task_id of the task to delete"],
+        task_id: Annotated[
+            str,
+            "The UUID task_id to delete. Get it from list_my_scheduled_tasks.",
+        ],
     ) -> str:
-        """Permanently delete a scheduled task from the database. This cannot
-        be undone. Use list_my_scheduled_tasks first to get the task_id."""
-        from a365_agent.storage import get_storage
+        """Permanently delete a scheduled task from PostgreSQL. This cannot be
+        undone.
 
-        storage = await get_storage()
-        deleted = await storage.delete_scheduled_task(task_id)
-        if not deleted:
-            return f"Task with task_id '{task_id}' was not found. Use list_my_scheduled_tasks to see your tasks."
+        Call this tool when the user asks to remove or delete a specific task.
+        You must provide the task_id. If you don't have it, call
+        list_my_scheduled_tasks first to look it up."""
+        try:
+            from a365_agent.storage import get_storage
 
-        return f"Task '{task_id}' has been permanently deleted."
+            storage = await get_storage()
+            deleted = await storage.delete_scheduled_task(task_id)
+            if not deleted:
+                return f"Task {task_id} not found. Use list_my_scheduled_tasks to check your tasks."
+
+            return f"Task deleted. ID: {task_id}"
+        except Exception as e:
+            logger.error(f"delete_scheduled_task failed: {e}")
+            return f"Error deleting task: {e}"
 
     return [
         list_my_scheduled_tasks,

@@ -123,8 +123,8 @@ class GenericAgentHost(NotificationHandlerMixin):
     """
     
     # Processing timeout constants
-    FIRST_REQUEST_TIMEOUT = 180  # 3 minutes for first request (MCP init)
-    NORMAL_REQUEST_TIMEOUT = 150  # 2.5 minutes for normal requests (must be > agent's PROCESSING_TIMEOUT)
+    FIRST_REQUEST_TIMEOUT = 120  # 2 minutes for first request (MCP init)
+    NORMAL_REQUEST_TIMEOUT = 90   # 90s for normal requests
     
     def __init__(
         self,
@@ -546,7 +546,7 @@ class GenericAgentHost(NotificationHandlerMixin):
                     if is_first_request:
                         logger.info("🔄 First request - MCP initialization required")
                         await context.send_activity(
-                            "🔧 **Getting ready!** Connecting to Microsoft 365 services. "
+                            "Getting ready! Connecting to Microsoft 365 services. "
                             "This may take 30-60 seconds..."
                         )
                     
@@ -561,13 +561,8 @@ class GenericAgentHost(NotificationHandlerMixin):
                                 self.auth_handler_name,
                                 context,
                             )
-                            # Only send if response is meaningful and agent didn't
-                            # already post via MCP postMessage tool
-                            if response and response.strip():
-                                await context.send_activity(response)
-                                logger.info("✅ Response sent")
-                            else:
-                                logger.info("✅ Agent handled request (response sent via MCP tools)")
+                            await context.send_activity(response)
+                            logger.info("✅ Response sent")
                             
                             if is_first_request:
                                 logger.info("✅ First request completed - MCP initialized")
@@ -575,7 +570,7 @@ class GenericAgentHost(NotificationHandlerMixin):
                     except asyncio.TimeoutError:
                         logger.warning(f"⏳ Request timed out after {timeout}s")
                         await context.send_activity(
-                            "⏳ I'm sorry, your request is taking too long. "
+                            "Sorry, your request is taking too long. "
                             "Please try a simpler query."
                         )
                         

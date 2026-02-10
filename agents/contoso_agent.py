@@ -110,6 +110,9 @@ class ContosoAgent(AgentBase):
     # Processing timeout (seconds)
     PROCESSING_TIMEOUT = 120  # 2 minutes max for complex tasks with MCP
     EMAIL_PROCESSING_TIMEOUT = 60  # Email needs time for MCP tools
+
+    # Feature flag: set PG_ENABLED=true to enable PostgreSQL init gate + history
+    PG_ENABLED = os.environ.get("PG_ENABLED", "false").lower() == "true"
     
     def __init__(self):
         """Initialize the Contoso Agent."""
@@ -135,8 +138,6 @@ class ContosoAgent(AgentBase):
         # Track MCP initialization state
         self.mcp_servers_initialized = False
         
-        # Track which pool is active for failover
-        self._using_planning_pool = False
         
         # =====================================================================
         # INITIALIZATION GATE STATE
@@ -151,6 +152,12 @@ class ContosoAgent(AgentBase):
         
         # Cache for sender AAD object ID → email resolution (avoids repeated Graph calls)
         self._sender_email_cache: dict[str, str] = {}
+        
+        # Cached Graph API token (avoids redundant token exchanges per session)
+        self._cached_graph_token: Optional[str] = None
+        
+        # Reusable aiohttp session for Graph API calls
+        self._graph_session: Optional[aiohttp.ClientSession] = None
         
         # Local task management tools (registered after init gate resolves agent UPN)
         self._task_tools_registered = False
@@ -200,44 +207,17 @@ class ContosoAgent(AgentBase):
         )
         logger.info("✅ ChatAgent created")
     
-    def _upgrade_to_planning_model(self) -> None:
-        """
-        Swap the agent's chat_client to the planning model pool (smarter/more capable).
-        
-        Called after MCP initialization so that:
-        - Cheap default pool handles MCP tool registration (doesn't need intelligence)
-        - Planning pool handles actual reasoning, tool parameter generation, and execution
-        
-        This is a hot-swap: ChatAgent.chat_client is a plain attribute, so we
-        just reassign it. All MCP tools remain registered on the agent.
-        """
-        planning_pool = self.settings.planning_pool
-        if not planning_pool or len(planning_pool) == 0:
-            return  # No planning pool configured, keep using the default pool
-        
-        planning_config = planning_pool.get_next_model()
-        logger.info(f"🧠 Upgrading agent to planning model: {planning_config.name}")
-        
-        planning_client = AzureOpenAIChatClient(
-            endpoint=planning_config.endpoint,
-            api_key=planning_config.api_key,
-            deployment_name=planning_config.deployment,
-            api_version=planning_config.api_version,
-        )
-        
-        # Hot-swap the chat client on the existing agent (keeps all MCP tools intact)
-        self.agent.chat_client = planning_client
-        self.chat_client = planning_client
-        self.current_model = planning_config
-        
-        # Track that we're now using the planning pool for failover
-        self._using_planning_pool = True
-        
-        logger.info(f"✅ Agent now using planning model: {planning_config.name}")
-    
     async def initialize(self) -> None:
         """Initialize the agent (called at startup)."""
-        logger.info("✅ ContosoAgent initialized")
+        if self.PG_ENABLED:
+            try:
+                from a365_agent.storage import get_storage
+                await get_storage()
+                logger.info("ContosoAgent initialized (PG pool ready)")
+            except Exception as e:
+                logger.warning(f"PG pool pre-init failed (will retry on first use): {e}")
+        else:
+            logger.info("ContosoAgent initialized (PG disabled)")
     
     async def _ensure_mcp_initialized(
         self,
@@ -272,9 +252,6 @@ class ContosoAgent(AgentBase):
         
         self.mcp_servers_initialized = True
         logger.info("✅ MCP servers ready")
-        
-        # Upgrade to planning model for actual reasoning & execution
-        self._upgrade_to_planning_model()
 
     async def _reset_mcp_after_error(self) -> None:
         """Best-effort cleanup for MCP resources after a failure."""
@@ -295,28 +272,77 @@ class ContosoAgent(AgentBase):
             return str(result.content)
         return str(result)
 
-    def _get_active_pool(self) -> Optional["AzureOpenAIModelPool"]:
-        """Return the pool currently driving the agent (planning if upgraded, default otherwise)."""
-        if self._using_planning_pool and self.settings.planning_pool:
-            return self.settings.planning_pool
-        return self.settings.model_pool
-
-    def _switch_chat_client(self, model_config: AzureOpenAIModelConfig) -> None:
+    async def _run_with_failover(
+        self, message: str, max_retries: int = 3, thread: "AgentThread | None" = None
+    ) -> str:
         """
-        Hot-swap the agent's chat_client to a different model config.
+        Run agent with automatic failover to other models on rate limiting (429).
         
-        Unlike _create_chat_client + _create_agent, this preserves the existing agent
-        and all its registered MCP tools — only the underlying LLM changes.
+        Args:
+            message: The message to process
+            max_retries: Maximum number of failover attempts
+            thread: Optional AgentThread with conversation history
+            
+        Returns:
+            The agent's response
         """
-        self.current_model = model_config
-        self.chat_client = AzureOpenAIChatClient(
-            endpoint=model_config.endpoint,
-            api_key=model_config.api_key,
-            deployment_name=model_config.deployment,
-            api_version=model_config.api_version,
-        )
-        self.agent.chat_client = self.chat_client
-        logger.info(f"🔄 Switched to model: {model_config.name}")
+        last_error = None
+        
+        for attempt in range(max_retries):
+            try:
+                logger.info(f"🤖 Calling agent.run() (attempt {attempt + 1}/{max_retries})...")
+                result = await self.agent.run(message, thread=thread)
+                logger.info("✅ Agent response received")
+                
+                # Success - clear any throttle on current model
+                if self.settings.model_pool and self.current_model:
+                    self.settings.model_pool.clear_throttle(self.current_model)
+                
+                return self._extract_result(result) or "I couldn't process your request."
+                
+            except Exception as e:
+                error_str = str(e).lower()
+                last_error = e
+                
+                # Check if it's a rate limiting error (429)
+                is_rate_limit = (
+                    "429" in error_str or 
+                    "rate limit" in error_str or 
+                    "too many requests" in error_str or
+                    "retry" in error_str
+                )
+                
+                if is_rate_limit and self.settings.model_pool and len(self.settings.model_pool) > 1:
+                    # Mark current model as throttled
+                    if self.current_model:
+                        # Extract retry-after if present, default to 60s
+                        retry_after = 60.0
+                        if "retry" in error_str:
+                            # Try to extract seconds from error message
+                            import re
+                            match = re.search(r'(\d+\.?\d*)\s*second', error_str)
+                            if match:
+                                retry_after = float(match.group(1))
+                        
+                        self.settings.model_pool.mark_throttled(self.current_model, retry_after)
+                    
+                    # Get next available model
+                    available = self.settings.model_pool.available_count
+                    logger.warning(f"🔄 Rate limited! Failover attempt {attempt + 1}/{max_retries}. Available models: {available}/{len(self.settings.model_pool)}")
+                    
+                    # Switch to next model
+                    self._create_chat_client()
+                    self._create_agent()
+                    
+                    # Small delay before retry
+                    await asyncio.sleep(0.5)
+                else:
+                    # Not a rate limit error, or no failover available
+                    raise
+        
+        # All retries exhausted
+        logger.error(f"All {max_retries} failover attempts failed")
+        raise last_error or Exception("All models failed")
 
     def _ensure_task_tools(self) -> None:
         """
@@ -390,100 +416,6 @@ class ContosoAgent(AgentBase):
         except Exception as e:
             logger.warning(f"⚠️ Failed to persist conversation exchange: {e}")
 
-    async def _run_with_failover(
-        self, message: str, max_retries: int = 3, thread: Optional[AgentThread] = None
-    ) -> str:
-        """
-        Run agent with automatic failover to other models on rate limiting (429).
-        
-        Args:
-            message: The message to process
-            max_retries: Maximum number of failover attempts
-            thread: Optional AgentThread for conversation history
-            
-        Returns:
-            The agent's response
-        """
-        last_error = None
-        
-        for attempt in range(max_retries):
-            try:
-                logger.info(f"🤖 Calling agent.run() (attempt {attempt + 1}/{max_retries})...")
-                result = await self.agent.run(message, thread=thread)
-                logger.info("✅ Agent response received")
-                
-                # Success - clear any throttle on current model
-                active_pool = self._get_active_pool()
-                if active_pool and self.current_model:
-                    active_pool.clear_throttle(self.current_model)
-                
-                return self._extract_result(result) or "I couldn't process your request."
-                
-            except Exception as e:
-                error_str = str(e).lower()
-                last_error = e
-                
-                # Content filter errors — try failover to another model
-                # (different deployments may have different filter configs)
-                is_content_filter = (
-                    "content_filter" in error_str or
-                    "content management policy" in error_str or
-                    "responsibleaipolicyviolation" in error_str
-                )
-                if is_content_filter:
-                    active_pool = self._get_active_pool()
-                    if active_pool and len(active_pool) > 1 and attempt < max_retries - 1:
-                        logger.warning(f"🚫 Content filter on {self.current_model.name} — trying next model")
-                        next_model = active_pool.get_next_model()
-                        # Skip if we'd just retry the same model
-                        if next_model is not self.current_model:
-                            self._switch_chat_client(next_model)
-                            await asyncio.sleep(0.5)
-                            continue
-                    logger.error("🚫 Content filter rejection — all models rejected")
-                    raise
-                
-                # Check if it's a rate limiting error (429)
-                is_rate_limit = (
-                    "429" in error_str or 
-                    "rate limit" in error_str or 
-                    "too many requests" in error_str or
-                    "retry" in error_str
-                )
-                
-                active_pool = self._get_active_pool()
-                if is_rate_limit and active_pool and len(active_pool) > 1:
-                    # Mark current model as throttled
-                    if self.current_model:
-                        # Extract retry-after if present, default to 60s
-                        retry_after = 60.0
-                        if "retry" in error_str:
-                            # Try to extract seconds from error message
-                            import re
-                            match = re.search(r'(\d+\.?\d*)\s*second', error_str)
-                            if match:
-                                retry_after = float(match.group(1))
-                        
-                        active_pool.mark_throttled(self.current_model, retry_after)
-                    
-                    # Get next available model
-                    available = active_pool.available_count
-                    logger.warning(f"🔄 Rate limited! Failover attempt {attempt + 1}/{max_retries}. Available models: {available}/{len(active_pool)}")
-                    
-                    # Switch to next model in the active pool
-                    next_model = active_pool.get_next_model()
-                    self._switch_chat_client(next_model)
-                    
-                    # Small delay before retry
-                    await asyncio.sleep(0.5)
-                else:
-                    # Not a rate limit error, or no failover available
-                    raise
-        
-        # All retries exhausted
-        logger.error(f"All {max_retries} failover attempts failed")
-        raise last_error or Exception("All models failed")
-    
     # =========================================================================
     # DIRECT GRAPH API (fully deterministic, no LLM)
     # =========================================================================
@@ -496,7 +428,11 @@ class ContosoAgent(AgentBase):
         auth_handler_name: Optional[str],
         context: TurnContext,
     ) -> Optional[str]:
-        """Exchange the agentic token for a Microsoft Graph API token."""
+        """Exchange the agentic token for a Microsoft Graph API token.
+        Caches the token for the session to avoid redundant exchanges."""
+        # Return cached token if available
+        if self._cached_graph_token:
+            return self._cached_graph_token
         if not auth_handler_name:
             return None
         try:
@@ -506,11 +442,19 @@ class ContosoAgent(AgentBase):
                 auth_handler_id=auth_handler_name,
             )
             if token_result and hasattr(token_result, "token") and token_result.token:
-                logger.info("✅ Graph API token obtained")
+                self._cached_graph_token = token_result.token
+                logger.info("Graph API token obtained")
                 return token_result.token
         except Exception as e:
-            logger.warning(f"⚠️ Graph token exchange failed: {e}")
+            logger.warning(f"Graph token exchange failed: {e}")
         return None
+
+    async def _get_graph_session(self) -> aiohttp.ClientSession:
+        """Reuse a single aiohttp session for all Graph calls."""
+        if self._graph_session is None or self._graph_session.closed:
+            timeout = aiohttp.ClientTimeout(total=15, connect=5)
+            self._graph_session = aiohttp.ClientSession(timeout=timeout)
+        return self._graph_session
 
     async def _graph_request(
         self, method: str, path: str, token: str, body: Optional[dict] = None
@@ -522,16 +466,18 @@ class ContosoAgent(AgentBase):
             "Content-Type": "application/json",
         }
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.request(
-                    method, url, json=body, headers=headers
-                ) as resp:
-                    if resp.status in (200, 201):
-                        return await resp.json()
-                    text = await resp.text()
-                    logger.error(
-                        f"Graph {method} {path}: {resp.status} — {text[:300]}"
-                    )
+            session = await self._get_graph_session()
+            async with session.request(
+                method, url, json=body, headers=headers
+            ) as resp:
+                if resp.status in (200, 201):
+                    return await resp.json()
+                text = await resp.text()
+                logger.error(
+                    f"Graph {method} {path}: {resp.status} — {text[:300]}"
+                )
+        except asyncio.TimeoutError:
+            logger.error(f"Graph {method} {path}: timed out (15s)")
         except Exception as e:
             logger.error(f"Graph {method} {path} exception: {e}")
         return None
@@ -607,11 +553,13 @@ class ContosoAgent(AgentBase):
                 "Please try again or contact an administrator."
             )
 
-        # 1. Look up agent by UPN
-        my_entry = await storage.get_agent(agent_upn)
+        # 1. Look up agent AND resolve manager in parallel
+        agent_task = asyncio.create_task(storage.get_agent(agent_upn))
+        manager_task = asyncio.create_task(self._resolve_manager_info(graph_token))
+        my_entry, manager_info = await asyncio.gather(agent_task, manager_task)
 
-        # 2. Resolve manager from Graph (always reliable)
-        manager_email = await self._resolve_manager_email(graph_token)
+        manager_email = manager_info.get("email", "")
+        manager_name = manager_info.get("displayName", "")
 
         # 3. Evaluate
         if my_entry:
@@ -635,9 +583,9 @@ class ContosoAgent(AgentBase):
                 self._init_gate_checked = True
                 self._init_gate_passed = False
                 self._agent_manager_email = manager_email
-                logger.info("⏳ Init gate: PENDING (instructions not complete)")
+                logger.info("Init gate: PENDING (instructions not complete)")
                 return False, (
-                    "Hi! My setup is still pending — my manager needs to complete "
+                    "Hi! My setup is still pending - my manager needs to complete "
                     "the instructions before I can assist anyone.\n\n"
                     "I've already notified them. Please check with my manager if you'd "
                     "like to expedite this."
@@ -645,31 +593,32 @@ class ContosoAgent(AgentBase):
         else:
             # NOT FOUND — create entry in PostgreSQL + notify manager
             return await self._init_gate_create_via_db(
-                agent_upn, graph_token, manager_email, context
+                agent_upn, graph_token, manager_email, manager_name, context
             )
 
-    async def _resolve_manager_email(self, token: str) -> str:
-        """Resolve the agent's manager email via Graph API (GET /me/manager)."""
+    async def _resolve_manager_info(self, token: str) -> dict:
+        """Resolve the agent's manager email AND display name in one Graph call."""
         manager_data = await self._graph_request("GET", "/me/manager", token)
         if not manager_data:
-            return ""
+            return {"email": "", "displayName": ""}
         email = (
             manager_data.get("mail")
             or manager_data.get("userPrincipalName", "")
         )
-        return (email or "").strip().lower()
+        return {
+            "email": (email or "").strip().lower(),
+            "displayName": manager_data.get("displayName", ""),
+        }
 
     async def _init_gate_create_via_db(
         self,
         agent_upn: str,
         graph_token: str,
         manager_email: str,
+        manager_name: str,
         context: TurnContext,
     ) -> tuple[bool, str]:
         """Create the agent registry entry in PostgreSQL + notify manager via Teams."""
-        # Get manager display name from Graph
-        manager_data = await self._graph_request("GET", "/me/manager", graph_token)
-        manager_name = manager_data.get("displayName", "") if manager_data else ""
         logger.info(f"📝 Agent manager: {manager_name} ({manager_email})")
 
         # Create agent registry entry in PostgreSQL
@@ -697,17 +646,17 @@ class ContosoAgent(AgentBase):
             sender_is_manager = passed
 
         if sender_is_manager:
-            logger.info("✅ Sender is the manager — skipping Teams DM, giving instructions")
+            logger.info("Sender is the manager - skipping Teams DM, giving instructions")
             return False, (
                 f"Hi {manager_name or 'there'}! I've just been activated and my "
                 f"profile has been created.\n\n"
-                f"Please provide the **Instructions** for my setup, "
+                f"Please provide the Instructions for my setup, "
                 f"then send me another message and I'll be ready to help!"
             )
 
-        # Sender is NOT the manager — notify manager via Teams
+        # Sender is NOT the manager — notify manager via Teams (fire-and-forget)
         if manager_email:
-            await self._notify_manager_via_teams(agent_upn, manager_email, manager_name)
+            asyncio.create_task(self._notify_manager_via_teams(agent_upn, manager_email, manager_name))
 
         manager_display = manager_name or manager_email or "your manager"
         return False, (
@@ -829,68 +778,34 @@ class ContosoAgent(AgentBase):
         auth_handler_name: Optional[str],
         context: TurnContext,
     ) -> str:
-        """Process a user message and return a response."""
+        """Process a user message and return a response.
+
+        When PG_ENABLED=false (default): straight-through MCP + LLM, with
+        in-memory conversation history but no database init-gate or task tools.
+        When PG_ENABLED=true: full init gate, PG-backed history, and task tools.
+        """
         try:
-            # Ensure MCP is initialized
+            if self.PG_ENABLED:
+                return await self._process_with_pg(message, auth, auth_handler_name, context)
+
+            # ----- lightweight path (no PostgreSQL) -----------------------
             await self._ensure_mcp_initialized(auth, auth_handler_name, context)
-            
-            # ============================================================
-            # DETERMINISTIC INITIALIZATION GATE (code-enforced, not LLM)
-            # ============================================================
-            gate_passed, gate_message = await self._ensure_init_gate(
-                auth, auth_handler_name, context
-            )
-            if not gate_passed:
-                logger.info(f"🚫 Init gate blocked request: {gate_message[:80]}...")
-                return gate_message
-            # ============================================================
 
-            # In dev mode, skip chat history retrieval (Playground doesn't have real chats)
-            is_dev_mode = _is_dev_mode()
-            
-            # Extract chat ID from context for conversation history retrieval
-            chat_id = None
-            if not is_dev_mode and context.activity and context.activity.conversation:
-                chat_id = getattr(context.activity.conversation, "id", None)
-            
-            # Register local task tools (once, after UPN is known)
-            self._ensure_task_tools()
+            # Maintain in-memory conversation history keyed by conversation ID
+            conv_id = "unknown"
+            if context.activity and context.activity.conversation:
+                conv_id = getattr(context.activity.conversation, "id", None) or "unknown"
 
-            # Build the prompt with chat context
-            # Include the manager's instructions from the agent registry if available
-            instructions_context = ""
-            if self._agent_instructions:
-                instructions_context = f"""=== Manager Instructions ===
-Follow these instructions when handling requests.
+            thread = self._threads.get(conv_id)
+            if thread is None:
+                thread = AgentThread()
+                self._threads[conv_id] = thread
 
-{self._agent_instructions}
-
-=== End Instructions ===
-
-"""
-            
-            if chat_id:
-                augmented_message = f"""{instructions_context}Chat ID (use with listChatMessages if you need prior conversation context): {chat_id}
-
-USER MESSAGE:
-{message}"""
-            else:
-                augmented_message = f"""{instructions_context}USER MESSAGE:
-{message}"""
-            
-            # Get or create conversation thread for history
-            conv_id = chat_id or "unknown"
-            thread = await self._get_or_create_thread(conv_id)
-
-            # Process with timeout and automatic failover on rate limits
             async with asyncio.timeout(self.PROCESSING_TIMEOUT):
-                response = await self._run_with_failover(augmented_message, thread=thread)
-
-            # Persist the exchange to PostgreSQL for future history
-            await self._save_exchange_to_pg(conv_id, message, response)
+                response = await self._run_with_failover(message, thread=thread)
 
             return response
-            
+
         except asyncio.TimeoutError:
             logger.error(f"Processing timeout after {self.PROCESSING_TIMEOUT}s")
             await self._reset_mcp_after_error()
@@ -899,16 +814,66 @@ USER MESSAGE:
             error_str = str(e).lower()
             logger.error(f"Error processing message: {e}")
             await self._reset_mcp_after_error()
-            
-            # Clean user-facing message for content filter errors
+
             if "content_filter" in error_str or "responsibleaipolicyviolation" in error_str:
                 return (
                     "Sorry, the AI service's content filter flagged this request. "
-                    "This can happen with certain prompt patterns. Please try rephrasing "
-                    "your message, or contact your administrator if this persists."
+                    "Please try rephrasing your message."
                 )
-            
+
             return "Sorry, I encountered an error processing your request. Please try again."
+
+    async def _process_with_pg(
+        self,
+        message: str,
+        auth: Authorization,
+        auth_handler_name: Optional[str],
+        context: TurnContext,
+    ) -> str:
+        """Full processing path with PostgreSQL init gate + conversation history.
+
+        Only called when PG_ENABLED=true.
+        """
+        # Init gate (also initialises MCP on first call)
+        gate_passed, gate_message = await self._ensure_init_gate(
+            auth, auth_handler_name, context
+        )
+        if not gate_passed:
+            logger.info(f"Init gate blocked: {gate_message[:80]}")
+            return gate_message
+
+        is_dev_mode = _is_dev_mode()
+
+        chat_id = None
+        if not is_dev_mode and context.activity and context.activity.conversation:
+            chat_id = getattr(context.activity.conversation, "id", None)
+
+        self._ensure_task_tools()
+
+        instructions_context = ""
+        if self._agent_instructions:
+            instructions_context = (
+                f"=== Manager Instructions ===\n{self._agent_instructions}\n"
+                f"=== End Instructions ===\n\n"
+            )
+
+        if chat_id:
+            augmented_message = (
+                f"{instructions_context}"
+                f"Chat ID (use with listChatMessages if needed): {chat_id}\n\n"
+                f"USER MESSAGE:\n{message}"
+            )
+        else:
+            augmented_message = f"{instructions_context}USER MESSAGE:\n{message}"
+
+        conv_id = chat_id or "unknown"
+        thread = await self._get_or_create_thread(conv_id)
+
+        async with asyncio.timeout(self.PROCESSING_TIMEOUT):
+            response = await self._run_with_failover(augmented_message, thread=thread)
+
+        await self._save_exchange_to_pg(conv_id, message, response)
+        return response
     
     # =========================================================================
     # NOTIFICATION HANDLERS
@@ -1219,12 +1184,15 @@ Respond appropriately:"""
         """Clean up agent resources."""
         try:
             await self.mcp_service.cleanup()
+            # Close Graph HTTP session
+            if self._graph_session and not self._graph_session.closed:
+                await self._graph_session.close()
             # Close PostgreSQL connection pool
             try:
                 storage = await get_storage()
                 await storage.close()
             except Exception as e:
                 logger.warning(f"PostgreSQL cleanup warning: {e}")
-            logger.info("✅ ContosoAgent cleanup completed")
+            logger.info("ContosoAgent cleanup completed")
         except Exception as e:
             logger.error(f"Cleanup error: {e}")

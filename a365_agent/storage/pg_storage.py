@@ -65,18 +65,28 @@ class PostgresStorage:
     # ------------------------------------------------------------------
 
     async def connect(self, min_size: int = 2, max_size: int = 10) -> None:
-        """Create the connection pool."""
+        """Create the connection pool with timeouts to prevent hanging."""
         if self._pool is not None:
             return
         try:
             t0 = time.monotonic()
-            self._pool = await asyncpg.create_pool(
-                self.dsn, min_size=min_size, max_size=max_size
+            self._pool = await asyncio.wait_for(
+                asyncpg.create_pool(
+                    self.dsn,
+                    min_size=min_size,
+                    max_size=max_size,
+                    command_timeout=15,       # per-query timeout
+                    timeout=10,               # per-connection acquire timeout
+                ),
+                timeout=15,  # overall pool creation timeout
             )
             elapsed = (time.monotonic() - t0) * 1000
-            logger.info(f"✅ PostgreSQL connection pool created ({elapsed:.0f}ms)")
+            logger.info(f"PostgreSQL pool created ({elapsed:.0f}ms)")
+        except asyncio.TimeoutError:
+            logger.error("PostgreSQL connection timed out (15s)")
+            raise ConnectionError("PostgreSQL connection timed out")
         except Exception as e:
-            logger.error(f"❌ PostgreSQL connection failed: {e}")
+            logger.error(f"PostgreSQL connection failed: {e}")
             raise
 
     async def close(self) -> None:

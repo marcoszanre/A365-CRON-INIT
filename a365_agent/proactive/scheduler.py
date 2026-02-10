@@ -20,6 +20,11 @@ Usage (standalone - for testing):
 Usage (integrated - started alongside the HTTP server):
     The ``create_and_run_host`` path in main.py launches the scheduler
     as a background asyncio task when ``CRON_ENABLED=true``.
+
+Timeouts:
+    - Per-task execution: CRON_TASK_TIMEOUT_SECONDS (default: 120)
+    - MCP initialization: 60s
+    - Token acquisition: 30s
 """
 
 import asyncio
@@ -41,12 +46,20 @@ logger = logging.getLogger(__name__)
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _load_cron_system_prompt() -> str:
-    """Load the cron system prompt from agents/cron_system_prompt.md."""
+def _load_cron_system_prompt(agent_upn: str = "", manager_email: str = "") -> str:
+    """Load the cron system prompt and inject agent identity.
+
+    The prompt template uses {agent_upn} and {manager_email} placeholders
+    so the LLM already knows who it is without calling getMyProfile.
+    """
     path = Path(__file__).resolve().parent.parent.parent / "agents" / "cron_system_prompt.md"
     if not path.exists():
         raise FileNotFoundError(f"Required file not found: {path}")
-    return path.read_text(encoding="utf-8").strip()
+    raw = path.read_text(encoding="utf-8").strip()
+    try:
+        return raw.format(agent_upn=agent_upn, manager_email=manager_email)
+    except KeyError:
+        return raw
 
 
 def _render_task_prompt(task_prompt: str, manager_email: str, agent_upn: str) -> str:
@@ -89,6 +102,7 @@ class ProactiveScheduler:
         self.interval = interval_seconds or int(
             os.getenv("CRON_INTERVAL_SECONDS", "3600")
         )
+        self.task_timeout = int(os.getenv("CRON_TASK_TIMEOUT_SECONDS", "120"))
         self._running = False
         self._task: Optional[asyncio.Task] = None
         self._token_provider = ProactiveTokenProvider()
@@ -170,28 +184,36 @@ class ProactiveScheduler:
         """Acquire token for one agent, run all its scheduled tasks."""
         agent_upn = agent_row["agent_user_id"]
         manager_email = agent_row.get("manager_email", "")
-        logger.info(f"👤 Processing agent: {agent_upn} (manager: {manager_email})")
+        logger.info(f"Processing agent: {agent_upn} (manager: {manager_email})")
 
         # Build per-agent credentials (Blueprint from .env + identity from DB)
         creds = AgentCredentials.from_agent_row(agent_row)
         missing = creds.validate()
         if missing:
             logger.error(
-                f"⚠️ Skipping {agent_upn} — missing credentials: {', '.join(missing)}"
+                f"Skipping {agent_upn} — missing credentials: {', '.join(missing)}"
             )
             return
 
-        # Acquire MCP token for this agent
-        mcp_token = await self._token_provider.acquire_mcp_token(creds)
-        logger.info(f"🔑 Token acquired for {agent_upn}")
+        # Acquire MCP token for this agent (with timeout)
+        try:
+            async with asyncio.timeout(30):
+                mcp_token = await self._token_provider.acquire_mcp_token(creds)
+            logger.info(f"Token acquired for {agent_upn}")
+        except asyncio.TimeoutError:
+            logger.error(f"Token acquisition timed out for {agent_upn} (30s)")
+            return
+        except Exception as e:
+            logger.error(f"Token acquisition failed for {agent_upn}: {e}")
+            return
 
         # Get scheduled tasks for this agent
         tasks = await storage.get_scheduled_tasks(agent_upn)
         if not tasks:
-            logger.info(f"📋 No enabled tasks for {agent_upn} — skipping")
+            logger.info(f"No enabled tasks for {agent_upn} — skipping")
             return
 
-        logger.info(f"📋 {len(tasks)} task(s) for {agent_upn}")
+        logger.info(f"{len(tasks)} task(s) for {agent_upn}")
 
         # Init MCP servers once per agent (all tasks share the same session)
         settings = get_settings()
@@ -209,22 +231,34 @@ class ProactiveScheduler:
             api_version=model.api_version,
         )
 
-        system_prompt = _load_cron_system_prompt()
+        system_prompt = _load_cron_system_prompt(agent_upn=agent_upn, manager_email=manager_email)
         mock_auth = MockAuthorization(mcp_token)
         mock_ctx = MockTurnContext(agent_upn)
 
         mcp_service = MCPService()
-        agent = await mcp_service.initialize_with_bearer_token(
-            chat_client=chat_client,
-            agent_instructions=system_prompt,
-            bearer_token=mcp_token,
-            auth=mock_auth,
-            auth_handler_name="PROACTIVE-CRON",
-            turn_context=mock_ctx,
-        )
+        try:
+            async with asyncio.timeout(60):
+                agent = await mcp_service.initialize_with_bearer_token(
+                    chat_client=chat_client,
+                    agent_instructions=system_prompt,
+                    bearer_token=mcp_token,
+                    auth=mock_auth,
+                    auth_handler_name="PROACTIVE-CRON",
+                    turn_context=mock_ctx,
+                )
+        except asyncio.TimeoutError:
+            logger.error(f"MCP initialization timed out for {agent_upn} (60s)")
+            await mcp_service.cleanup()
+            return
+        except Exception as e:
+            logger.error(f"MCP initialization failed for {agent_upn}: {e}")
+            await mcp_service.cleanup()
+            return
 
         if agent is None:
-            raise RuntimeError(f"MCP initialization returned None for {agent_upn}")
+            logger.error(f"MCP initialization returned None for {agent_upn}")
+            await mcp_service.cleanup()
+            return
 
         # Optionally upgrade to planning model
         planning_pool = settings.planning_pool
@@ -237,14 +271,15 @@ class ProactiveScheduler:
                 api_version=planning_cfg.api_version,
             )
             agent.chat_client = planning_client
-            logger.info(f"🧠 Upgraded to planning model: {planning_cfg.name}")
+            logger.info(f"Upgraded to planning model: {planning_cfg.name}")
 
-        # Execute each task
-        for task_row in tasks:
-            await self._execute_task(storage, agent, agent_upn, manager_email, task_row)
-
-        # Cleanup MCP for this agent
-        await mcp_service.cleanup()
+        # Execute each task (with per-task timeout)
+        try:
+            for task_row in tasks:
+                await self._execute_task(storage, agent, agent_upn, manager_email, task_row)
+        finally:
+            # Always cleanup MCP, even if a task fails
+            await mcp_service.cleanup()
 
     # ------------------------------------------------------------------
     # Single task execution
@@ -253,22 +288,26 @@ class ProactiveScheduler:
     async def _execute_task(
         self, storage, agent, agent_upn: str, manager_email: str, task_row: dict
     ) -> None:
-        """Run one scheduled task and log the result."""
+        """Run one scheduled task with a timeout and log the result."""
         task_id = task_row["task_id"]
         task_name = task_row["task_name"]
         raw_prompt = task_row["task_prompt"]
 
-        logger.info(f"🤖 Running task '{task_name}' for {agent_upn}...")
+        logger.info(f"Running task '{task_name}' for {agent_upn} (timeout={self.task_timeout}s)...")
 
         # Render the prompt with runtime variables
         prompt = _render_task_prompt(raw_prompt, manager_email, agent_upn)
+        logger.info(f"Task prompt: {prompt[:200]}{'...' if len(prompt) > 200 else ''}")
 
         task_start = datetime.now(timezone.utc)
         status = "success"
         response = ""
 
         try:
-            result = await agent.run(prompt)
+            async with asyncio.timeout(self.task_timeout):
+                logger.info(f"Calling agent.run() for task '{task_name}'...")
+                result = await agent.run(prompt)
+                logger.info(f"agent.run() returned for task '{task_name}'")
 
             # Extract response text
             if hasattr(result, "contents"):
@@ -281,13 +320,17 @@ class ProactiveScheduler:
                 response = str(result)
 
             logger.info(
-                f"✅ Task '{task_name}' completed: "
+                f"Task '{task_name}' completed: "
                 f"{response[:150]}{'...' if len(response) > 150 else ''}"
             )
+        except asyncio.TimeoutError:
+            status = "timeout"
+            response = f"Task timed out after {self.task_timeout}s"
+            logger.error(f"Task '{task_name}' timed out after {self.task_timeout}s")
         except Exception as e:
             status = "error"
             response = str(e)
-            logger.error(f"❌ Task '{task_name}' failed: {e}")
+            logger.error(f"Task '{task_name}' failed: {e}")
 
         # Update task result in DB
         task_end = datetime.now(timezone.utc)
