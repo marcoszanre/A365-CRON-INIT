@@ -251,6 +251,7 @@ class ContosoAgent(AgentBase):
             ) or self.agent
         
         self.mcp_servers_initialized = True
+        self._task_tools_registered = False  # New agent from MCP SDK, task tools need re-registration
         logger.info("✅ MCP servers ready")
 
     async def _reset_mcp_after_error(self) -> None:
@@ -259,6 +260,7 @@ class ContosoAgent(AgentBase):
             await self.mcp_service.cleanup()
         finally:
             self.mcp_servers_initialized = False
+            self._task_tools_registered = False
     
     def _extract_result(self, result) -> str:
         """Extract text content from agent result."""
@@ -333,6 +335,10 @@ class ContosoAgent(AgentBase):
                     # Switch to next model
                     self._create_chat_client()
                     self._create_agent()
+                    self._task_tools_registered = False
+                    
+                    # Re-register task tools on the new agent
+                    self._ensure_task_tools()
                     
                     # Small delay before retry
                     await asyncio.sleep(0.5)
@@ -347,10 +353,29 @@ class ContosoAgent(AgentBase):
     def _ensure_task_tools(self) -> None:
         """
         Register local PostgreSQL task management tools on the agent.
-        Called once after the init gate resolves the agent UPN.
+        Called after the init gate resolves the agent UPN.
+        Re-registers if the agent object was recreated (MCP re-init, failover).
         """
-        if self._task_tools_registered or not self._agent_user_id:
+        if not self._agent_user_id:
             return
+
+        # Check if tools are actually present on the current agent, not just a flag.
+        # The agent object can be replaced by MCP init or failover, losing previously
+        # added tools while _task_tools_registered remains True.
+        if self._task_tools_registered:
+            existing = self.agent.default_options.get("tools", [])
+            task_tool_names = {"list_my_scheduled_tasks", "create_scheduled_task", "update_scheduled_task", "delete_scheduled_task"}
+            has_task_tools = any(
+                getattr(t, "name", None) in task_tool_names
+                or (hasattr(t, "__name__") and t.__name__ in task_tool_names)
+                for t in existing
+            )
+            if has_task_tools:
+                return
+            # Tools are missing from the current agent — re-register
+            logger.info("🔄 Task tools missing from agent (agent was recreated), re-registering...")
+            self._task_tools_registered = False
+
         try:
             tools = create_task_tools(self._agent_user_id)
             existing = self.agent.default_options.setdefault("tools", [])
@@ -978,9 +1003,98 @@ class ContosoAgent(AgentBase):
         auth_handler_name: Optional[str],
         context: TurnContext,
     ) -> str:
-        """Handle email notifications — ALL emails are blocked. Agent only operates via Teams."""
-        logger.info("📧 Email notification received — BLOCKED (agent only responds via Teams)")
-        return ""  # Return empty — do not reply to any email
+        """Handle email notifications — process real user emails, ignore system notifications."""
+        # Filter out system-generated notifications (sharing, comment mentions, etc.)
+        if self._is_system_generated_email(context):
+            logger.info("📧 Email notification received — IGNORED (system-generated notification)")
+            return ""
+
+        try:
+            logger.info("📧 Processing user email notification")
+
+            # Initialize MCP for full tool access (mail reply, Teams, etc.)
+            await self._ensure_mcp_initialized(auth, auth_handler_name, context)
+
+            if self.PG_ENABLED:
+                gate_passed, gate_message = await self._ensure_init_gate(
+                    auth, auth_handler_name, context
+                )
+                if not gate_passed:
+                    logger.info(f"📧 Init gate blocked email processing: {gate_message[:80]}")
+                    return ""
+                self._ensure_task_tools()
+
+            # Extract email details
+            email_text = getattr(context.activity, "text", "") or ""
+            email_text = email_text.replace("<at>", "").replace("</at>", "").strip()
+
+            subject = ""
+            if context.activity.conversation:
+                subject = getattr(context.activity.conversation, "topic", "") or ""
+
+            sender_name = ""
+            sender_id = ""
+            if context.activity.from_property:
+                sender_name = getattr(context.activity.from_property, "name", "") or ""
+                sender_id = getattr(context.activity.from_property, "id", "") or ""
+
+            # Extract conversation ID from the notification entity and activity
+            conversation_id = ""
+            if hasattr(notification_activity, "email") and notification_activity.email:
+                conversation_id = getattr(notification_activity.email, "conversation_id", "") or ""
+            if not conversation_id and context.activity.conversation:
+                conversation_id = getattr(context.activity.conversation, "id", "") or ""
+
+            logger.info(
+                f"📧 Email from {sender_name} ({sender_id}), "
+                f"subject: '{subject[:60]}', conv_id: '{conversation_id[:40]}', "
+                f"body: '{email_text[:80]}...'"
+            )
+
+            instructions_context = ""
+            if self._agent_instructions:
+                instructions_context = (
+                    f"=== Manager Instructions ===\n{self._agent_instructions}\n"
+                    f"=== End Instructions ===\n\n"
+                )
+
+            async with asyncio.timeout(self.EMAIL_PROCESSING_TIMEOUT):
+                message = f"""{instructions_context}You received an email and were mentioned or addressed directly.
+
+FROM: {sender_name} ({sender_id})
+SUBJECT: {subject}
+CONVERSATION ID: {conversation_id}
+BODY: "{email_text}"
+
+HOW TO REPLY — follow these steps in order:
+
+1. First, call SearchMessages to find the email. Search by subject "{subject}" or by sender "{sender_name}".
+   This will return the message ID you need to reply.
+
+2. Once you have the message ID from the search results, call ReplyToMessage (or ReplyAllToMessage
+   if there are CC recipients or the email uses "us", "we", "team") with that message ID and your reply.
+
+3. After replying, confirm what you did.
+
+IMPORTANT:
+- You MUST use SearchMessages first to get the message ID, then ReplyToMessage/ReplyAllToMessage to reply.
+- Do NOT just return text — you must actually send the reply using the MCP mail tools.
+- Read the email carefully and respond helpfully and professionally.
+- If they ask you to do something (look up info, create a task, send a Teams message, etc.), do it AND reply to confirm.
+
+Respond appropriately:"""
+
+                response = await self._run_with_failover(message)
+
+            logger.info(f"📧 Email processed: {(response or '')[:80]}...")
+            return response or ""
+
+        except asyncio.TimeoutError:
+            logger.error(f"📧 Email processing timeout after {self.EMAIL_PROCESSING_TIMEOUT}s")
+            return ""
+        except Exception as e:
+            logger.error(f"📧 Email notification error: {e}")
+            return ""
     
     async def handle_word_notification(
         self,

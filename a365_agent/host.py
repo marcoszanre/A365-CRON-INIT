@@ -295,38 +295,33 @@ class GenericAgentHost(NotificationHandlerMixin):
                     logger.info("📧 EMAIL notification received")
                     
                     if not hasattr(self.agent_instance, "handle_email_notification"):
-                        await safe_send_email_response(
-                            context, "This agent doesn't support email notifications."
-                        )
+                        logger.info("📧 Agent does not support email notifications")
                         return
                     
-                    try:
-                        async with asyncio.timeout(self.EMAIL_NOTIFICATION_TIMEOUT):
+                    # Fire-and-forget: the agent will reply via MCP tools
+                    # (SearchMessages → ReplyToMessage). The notification channel's
+                    # ~30s reply window is too short for MCP processing, so we
+                    # don't try to use it at all.
+                    async def _process_email_background():
+                        try:
                             response = await self.agent_instance.handle_email_notification(
                                 notification_activity,
                                 self.agent_app.auth,
                                 self.auth_handler_name,
                                 context,
                             )
-                    except asyncio.TimeoutError:
-                        logger.warning(f"⚠️ Email timeout after {self.EMAIL_NOTIFICATION_TIMEOUT}s")
-                        response = "Thank you for your email. I'm still processing and will follow up."
+                            if response and response.strip():
+                                logger.info(f"📧 Email handled via MCP: {response[:80]}...")
+                            else:
+                                logger.info("📧 No response needed (system notification ignored)")
+                        except Exception as e:
+                            logger.error(f"❌ Background email processing error: {e}")
                     
-                    # When the agent uses MCP to send emails, we don't need to reply through
-                    # the notification channel. The MCP response IS the email. Just log and return.
-                    # Only try notification channel reply if MCP wasn't used (legacy fallback).
-                    if response and response.strip():
-                        logger.info(f"📧 Email handled: {response[:80]}...")
-                        # Skip notification channel reply - agent already sent via MCP
-                        # The notification channel has a ~30s timeout and often 404s anyway
-                    else:
-                        logger.info("📧 No response needed (system notification ignored)")
+                    asyncio.create_task(_process_email_background())
+                    logger.info("📧 Email processing started in background (agent will reply via MCP)")
                     
             except Exception as e:
                 logger.error(f"❌ Email notification error: {e}")
-                await safe_send_email_response(
-                    context, "Thank you for your email. I encountered an issue but will review it."
-                )
     
     def _register_word_handler(self, handler_config: dict) -> None:
         """Register Word notification handler."""
